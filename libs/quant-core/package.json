@@ -1,0 +1,20 @@
+{
+  "name": "quant-core",
+  "version": "1.0.0",
+  "description": "Shared quant library — regime detection, momentum ranking, rebalance logic, math helpers",
+  "main": "dist/index.js",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "technicalindicators": "^3.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
+  }
+}

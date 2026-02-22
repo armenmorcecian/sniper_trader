@@ -1,0 +1,86 @@
+services:
+  openclaw-gateway:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+      CLAUDE_AI_SESSION_KEY: ${CLAUDE_AI_SESSION_KEY}
+      CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY}
+      CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE}
+      PUPPETEER_SKIP_DOWNLOAD: "true"
+      PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+      - ${OPENCLAW_CONFIG_DIR}/signals:/home/node/.openclaw/signals
+    ports:
+      - "${OPENCLAW_GATEWAY_PORT:-18789}:18789"
+      - "${OPENCLAW_BRIDGE_PORT:-18790}:18790"
+    init: true
+    restart: unless-stopped
+    entrypoint: ["/home/node/.openclaw/entrypoint.sh"]
+    command: ["gateway", "--allow-unconfigured", "--bind", "${OPENCLAW_GATEWAY_BIND:-lan}", "--port", "18789"]
+    user: "root"
+
+  quant-signals:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+    env_file:
+      - ${OPENCLAW_CONFIG_DIR}/.env
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+      - ${OPENCLAW_CONFIG_DIR}/signals:/home/node/.openclaw/signals
+    working_dir: /home/node/.openclaw/workspace/services/quant-signals
+    entrypoint: ["npx", "tsx", "src/index.ts"]
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "const f=require('fs'),p=require('path');const m=JSON.parse(f.readFileSync(p.join(process.env.HOME,'.openclaw','signals','meta.json'),'utf-8'));const age=(Date.now()-new Date(m.lastRun).getTime())/60000;process.exit(age>60?1:0)"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  risk-monitor:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+    env_file:
+      - ${OPENCLAW_CONFIG_DIR}/.env
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+      - ${OPENCLAW_CONFIG_DIR}/signals:/home/node/.openclaw/signals
+    working_dir: /home/node/.openclaw/workspace/services/risk-monitor
+    entrypoint: ["npx", "tsx", "src/index.ts"]
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "const f=require('fs'),p=require('path');const m=JSON.parse(f.readFileSync(p.join(process.env.HOME,'.openclaw','signals','risk-monitor-meta.json'),'utf-8'));const age=(Date.now()-new Date(m.lastPing).getTime())/60000;process.exit(age>5?1:0)"]
+      interval: 3m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  openclaw-cli:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+      BROWSER: echo
+      CLAUDE_AI_SESSION_KEY: ${CLAUDE_AI_SESSION_KEY}
+      CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY}
+      CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE}
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+    stdin_open: true
+    tty: true
+    init: true
+    entrypoint: ["node", "dist/index.js"]

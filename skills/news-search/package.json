@@ -1,0 +1,21 @@
+{
+  "name": "news-search",
+  "version": "1.0.0",
+  "description": "News aggregation skill — RSS feeds + NewsAPI for trading intelligence",
+  "main": "src/news.skill.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.32.0",
+    "axios": "^1.7.0",
+    "dotenv": "^17.2.4",
+    "rss-parser": "^3.13.0",
+    "tsx": "^4.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.5.0"
+  }
+}

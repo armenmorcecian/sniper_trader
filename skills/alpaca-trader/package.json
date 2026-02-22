@@ -1,0 +1,22 @@
+{
+  "name": "alpaca-trader",
+  "version": "1.0.0",
+  "description": "Autonomous ETF trading skill for OpenClaw — paranoid sniper strategy via Alpaca",
+  "main": "src/alpaca.skill.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.32.0",
+    "axios": "^1.7.0",
+    "dotenv": "^17.2.4",
+    "quant-core": "file:../../libs/quant-core",
+    "technicalindicators": "^3.1.0",
+    "tsx": "^4.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}

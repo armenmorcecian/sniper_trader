@@ -1,0 +1,27 @@
+{
+  "name": "polymarket-trader",
+  "version": "1.0.0",
+  "description": "Autonomous Polymarket trading skill for OpenClaw — paranoid sniper survival strategy",
+  "main": "src/polymarket.skill.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@polymarket/clob-client": "^5.2.1",
+    "@sinclair/typebox": "^0.32.0",
+    "axios": "^1.7.0",
+    "dotenv": "^17.2.4",
+    "ethers": "^5.7.2",
+    "https-proxy-agent": "^7.0.6",
+    "quant-core": "file:../../libs/quant-core",
+    "technicalindicators": "^3.1.0",
+    "tsx": "^4.21.0",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.5.0"
+  }
+}

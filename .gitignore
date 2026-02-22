@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+*.tsbuildinfo
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# Lock files
+package-lock.json
+
+# Runtime data
+data/
+memory/
+*.db
+*.db-wal
+*.db-shm
+
+# Generated bin wrappers
+bin/
+
+# OpenClaw runtime state
+.openclaw/
+
+# Signals (runtime data written by services)
+signals/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
