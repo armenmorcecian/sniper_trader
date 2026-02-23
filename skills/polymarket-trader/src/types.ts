@@ -253,6 +253,66 @@ export interface RetryConfig {
   maxDelayMs: number;
 }
 
+// ─── Pair Arbitrage (Leg-Risk & Bailout) ────────────────────────────────────
+
+export interface ArbitrageParams {
+  /** Market condition ID (binary market with Yes/No outcomes) */
+  marketConditionId: string;
+  /** Which outcome to buy first (the "initiating leg") */
+  firstLeg: "Yes" | "No";
+  /** USDC amount to spend on each leg */
+  amount: number;
+  /** Limit price for the first leg order */
+  firstLegPrice: number;
+  /** Target profit margin in price units (e.g., 0.02 = 2 cents) */
+  margin: number;
+  /** Milliseconds to wait for the second leg before bailing out (default: 3000) */
+  legTimeoutMs?: number;
+  /** Milliseconds between order book polls during the hedge window (default: 500) */
+  pollIntervalMs?: number;
+}
+
+export type ArbitragePhase =
+  | "LEG1_PENDING"
+  | "LEG1_FILLED"
+  | "HEDGING"
+  | "LEG2_FILLED"
+  | "BAILING_OUT"
+  | "FLAT"
+  | "COMPLETE"
+  | "FAILED";
+
+export interface ArbitrageLegStatus {
+  outcome: "Yes" | "No";
+  orderId: string;
+  price: number;
+  size: number;
+  status: "pending" | "filled" | "cancelled" | "failed";
+}
+
+export interface ArbitrageResult {
+  /** Final state of the arbitrage attempt */
+  phase: ArbitragePhase;
+  /** First leg execution details */
+  leg1: ArbitrageLegStatus;
+  /** Second leg execution details (null if never attempted) */
+  leg2: ArbitrageLegStatus | null;
+  /** Whether the pair was fully locked in */
+  pairComplete: boolean;
+  /** Net P&L of the arbitrage (positive = profit, negative = bailout cost) */
+  netPnl: number;
+  /** Maximum acceptable price for leg 2: 1.00 - P_filled - margin */
+  maxAcceptablePrice: number;
+  /** Whether bailout was triggered */
+  bailoutTriggered: boolean;
+  /** Bailout sell details if applicable */
+  bailoutSell?: { orderId: string; price: number; size: number };
+  /** Total elapsed time in milliseconds */
+  elapsedMs: number;
+  /** Human-readable summary */
+  summary: string;
+}
+
 // ─── Bet Sizing ─────────────────────────────────────────────────────────────
 
 export interface BetSizeParams {

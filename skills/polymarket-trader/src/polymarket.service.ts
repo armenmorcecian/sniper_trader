@@ -735,6 +735,25 @@ export class PolymarketService {
   }
 
   /**
+   * Fetches the current status of an order by ID.
+   * Used by the arbitrage engine to poll for Leg 1 fill confirmation.
+   */
+  async getOrderStatus(
+    orderId: string,
+  ): Promise<{ status: string; price?: number }> {
+    await this.ensureInitialized();
+    const order = await withRetry(() =>
+      this.clobClient.getOrder(orderId),
+    );
+    const o = order as unknown as Record<string, unknown>;
+    const status = String(
+      o?.status || o?.order_status || "UNKNOWN",
+    ).toUpperCase();
+    const price = Number(o?.price || 0) || undefined;
+    return { status, price };
+  }
+
+  /**
    * Fetches order book for a specific token. Exposed for the check_order_depth tool.
    */
   async getOrderBookForToken(
