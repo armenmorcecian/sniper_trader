@@ -2,6 +2,7 @@ import "dotenv/config";
 import { Type, type Static } from "@sinclair/typebox";
 import { PolymarketService } from "./polymarket.service";
 import { analyzeOrderBookDepth, shouldAvoidMarket, checkStopLoss } from "./analysis";
+import { executePairArbitrage } from "./arbitrage";
 import { calculateBetSize } from "./utils";
 import { collectPrices, getStoredHistory } from "./price-collector";
 import { calculateIndicators } from "./indicators";
@@ -124,6 +125,16 @@ const PerformanceReportSchema = Type.Object({
   ], { description: "Filter by skill. Defaults to polymarket." })),
 });
 
+const ExecutePairArbitrageSchema = Type.Object({
+  marketConditionId: Type.String({ description: "Polymarket condition ID (must be a binary Yes/No market)" }),
+  firstLeg: Type.Union([Type.Literal("Yes"), Type.Literal("No")], { description: "Which outcome to buy first" }),
+  amount: Type.Number({ description: "USDC amount to spend on each leg" }),
+  firstLegPrice: Type.Number({ description: "Limit price for the first leg order (e.g., 0.45)" }),
+  margin: Type.Number({ description: "Target profit margin in price units (e.g., 0.02 = 2 cents guaranteed profit per unit)" }),
+  legTimeoutMs: Type.Optional(Type.Number({ default: 3000, description: "Milliseconds to wait for second leg before bailout (default: 3000)" })),
+  pollIntervalMs: Type.Optional(Type.Number({ default: 500, description: "Milliseconds between order book polls during hedge window (default: 500)" })),
+});
+
 // ─── Tool Types ─────────────────────────────────────────────────────────────
 
 type ScanMarketsParams = Static<typeof ScanMarketsSchema>;
@@ -135,6 +146,7 @@ type AnalyzeIndicatorsParams = Static<typeof AnalyzeIndicatorsSchema>;
 type CancelOrderParams = Static<typeof CancelOrderSchema>;
 type TradeJournalParams = Static<typeof TradeJournalSchema>;
 type PerformanceReportParams = Static<typeof PerformanceReportSchema>;
+type ExecutePairArbitrageParams = Static<typeof ExecutePairArbitrageSchema>;
 
 // ─── Parameter Normalization ────────────────────────────────────────────────
 // Agents frequently pass alternate param names. Map them to canonical names.
@@ -570,6 +582,102 @@ export const tools = [
         });
       } catch (err) {
         return { error: `performance_report: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    },
+  },
+
+  {
+    name: "execute_pair_arbitrage",
+    description:
+      "Execute a two-legged pair arbitrage on a binary market. " +
+      "Buys one outcome at a limit price, then dynamically hedges by buying the opposite outcome " +
+      "if the best ask falls within the profit window (1.00 - P_filled - margin). " +
+      "If the hedge timeout expires without completing the pair, automatically bails out by " +
+      "selling the filled leg to flatten directional risk. " +
+      "Pre-checks: daily loss circuit breaker, API health, concentration limits. " +
+      "All legs and bailout actions are recorded to the trade journal.",
+    parameters: ExecutePairArbitrageSchema,
+    handler: async (rawParams: ExecutePairArbitrageParams) => {
+      const params = normalizeParams(rawParams as Record<string, unknown>) as ExecutePairArbitrageParams;
+      if (!params.marketConditionId) {
+        return { error: "marketConditionId is required.", code: "MISSING_PARAM" };
+      }
+      try {
+        const service = getPolymarketService();
+
+        // ── Daily loss circuit breaker ──────────────────────────────────────
+        const portfolio = await service.getPortfolioValue();
+        const dailyPnl = portfolio.positions.reduce((sum, p) => sum + p.pnl, 0);
+        const maxDailyLoss = Number(process.env.POLY_MAX_DAILY_LOSS_PCT) || 10;
+        const cbResult = checkCircuitBreaker(dailyPnl, portfolio.totalEquity, maxDailyLoss);
+        if (cbResult.tripped) {
+          await service.cancelAllOrders();
+          recordTrade({
+            skill: "polymarket",
+            tool: "execute_pair_arbitrage",
+            conditionId: params.marketConditionId,
+            side: "BUY",
+            amount: params.amount,
+            price: params.firstLegPrice,
+            status: "blocked",
+            errorCode: "DAILY_LOSS_LIMIT",
+            equityAtTrade: portfolio.totalEquity,
+            metadata: { dailyPnlPercent: cbResult.dailyPnlPercent, cancelledOrders: true },
+          });
+          return {
+            error: "CIRCUIT_BREAKER",
+            message: cbResult.reason,
+            details: cbResult,
+            ordersCancelled: true,
+          };
+        }
+
+        // ── API availability check ─────────────────────────────────────────
+        if (!isApiAvailable("poly-gamma") || !isApiAvailable("poly-data")) {
+          recordTrade({
+            skill: "polymarket",
+            tool: "execute_pair_arbitrage",
+            conditionId: params.marketConditionId,
+            side: "BUY",
+            amount: params.amount,
+            status: "blocked",
+            errorCode: "API_UNAVAILABLE",
+          });
+          return { error: "API_UNAVAILABLE", message: "Polymarket APIs have too many consecutive failures. Operating in read-only mode." };
+        }
+
+        // ── Balance check ──────────────────────────────────────────────────
+        // Need enough for both legs in the worst case
+        const totalNeeded = params.amount * 2;
+        if (totalNeeded > portfolio.usdcBalance) {
+          return {
+            error: "INSUFFICIENT_FUNDS",
+            message: `Need $${totalNeeded.toFixed(2)} for both legs, have $${portfolio.usdcBalance.toFixed(2)}.`,
+          };
+        }
+
+        // ── Execute arbitrage engine ───────────────────────────────────────
+        return await executePairArbitrage(service, {
+          marketConditionId: params.marketConditionId,
+          firstLeg: params.firstLeg,
+          amount: params.amount,
+          firstLegPrice: params.firstLegPrice,
+          margin: params.margin,
+          legTimeoutMs: params.legTimeoutMs,
+          pollIntervalMs: params.pollIntervalMs,
+        });
+      } catch (err) {
+        recordTrade({
+          skill: "polymarket",
+          tool: "execute_pair_arbitrage",
+          conditionId: params.marketConditionId,
+          side: "BUY",
+          amount: params.amount,
+          price: params.firstLegPrice,
+          status: "error",
+          metadata: { error: err instanceof Error ? err.message : String(err) },
+        });
+        return formatAxiosError(err, `execute_pair_arbitrage(${params.marketConditionId})`);
       }
     },
   },

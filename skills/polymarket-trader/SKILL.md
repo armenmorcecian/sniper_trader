@@ -42,6 +42,33 @@ IMPORTANT:
 | `analyze_indicators` | `conditionId`, `outcome` | Calculate RSI(14), MACD(12,26,9), EMA(9,21) on collected price history. Needs 26+ snapshots. |
 | `trade_journal` | `action` (recent/daily/stats), `limit`, `since`, `date` | Query trade history, daily P&L summaries, win/loss stats. Actions: `recent` (last N trades), `daily` (day summary + today's count), `stats` (win rate, P&L, blocked count). |
 | `performance_report` | `period` (daily/weekly/monthly/all-time), `skill` (alpaca/polymarket) | Performance analytics: Sharpe ratio, max drawdown, win rate, profit factor, equity curve stats. Computed from trade journal + equity snapshots. |
+| `execute_pair_arbitrage` | `marketConditionId`, `firstLeg`, `amount`, `firstLegPrice`, `margin`, `legTimeoutMs`, `pollIntervalMs` | Two-legged pair arbitrage on binary markets. Places Leg 1 at limit, dynamically hedges Leg 2 within timeout, bails out if pair incomplete. Full audit trail. |
+
+## Pair Arbitrage (Leg-Risk & Bailout)
+
+Executes a two-legged arbitrage on binary Polymarket markets where Yes + No tokens always redeem for $1.00.
+
+**Mathematical basis:**
+- If `P_yes + P_no < 1.00`, buying both sides locks in guaranteed profit
+- `Max_Acceptable_Price(Leg2) = 1.00 - P_filled(Leg1) - margin`
+
+**Execution sequence:**
+1. Place Leg 1 as GTC limit order at `firstLegPrice`
+2. Wait for fill confirmation (poll order status)
+3. Start `legTimeoutMs` timer (default: 3000ms)
+4. During hedge window: poll order book every `pollIntervalMs` (default: 500ms)
+5. If best ask for opposite outcome ≤ `Max_Acceptable_Price` → send FOK market order
+6. **Bailout:** If timeout expires without pair completion → market-sell Leg 1 to flatten
+
+**Example:**
+```
+polymarket-trader execute_pair_arbitrage '{"marketConditionId":"0xabc...","firstLeg":"Yes","amount":5,"firstLegPrice":0.45,"margin":0.02}'
+```
+If Yes fills at 0.45, then `Max_Acceptable_Price(No) = 1.00 - 0.45 - 0.02 = 0.53`. If No's best ask ≤ 0.53, the engine crosses the spread to lock in ≥ $0.02/unit profit.
+
+**Pre-checks:** Daily loss circuit breaker, API health, balance validation (needs 2× amount for both legs).
+
+**Return fields:** `phase`, `leg1`, `leg2`, `pairComplete`, `netPnl`, `maxAcceptablePrice`, `bailoutTriggered`, `bailoutSell`, `elapsedMs`, `summary`.
 
 ## Key Technical Gotchas
 
