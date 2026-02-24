@@ -36,3 +36,13 @@ signals/
 # OS
 .DS_Store
 Thumbs.db
+
+# OpenClaw framework (external dependency)
+openclaw/
+
+# Claude Code local config
+.claude/
+
+# Temporary/scratch files
+tmp_*.ts
+NUL
