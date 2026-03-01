@@ -3,9 +3,37 @@ import * as path from "path";
 import { PolymarketService } from "./polymarket.service";
 import { resolveTokenId } from "./utils";
 import type { PriceSnapshot } from "./types";
+import { PredictionMarketParticleFilter } from "quant-core";
+import type { ParticleFilterState } from "quant-core";
 
 interface PriceHistory {
   [conditionId: string]: PriceSnapshot[];
+}
+
+/** Serialized particle filter states per conditionId */
+interface FilterStateStore {
+  [conditionId: string]: ParticleFilterState;
+}
+
+const FILTER_FILE = path.join(__dirname, "..", "data", "particle-filters.json");
+
+function loadFilterStates(): FilterStateStore {
+  try {
+    if (fs.existsSync(FILTER_FILE)) {
+      return JSON.parse(fs.readFileSync(FILTER_FILE, "utf-8"));
+    }
+  } catch {
+    // Corrupt file — start fresh
+  }
+  return {};
+}
+
+function saveFilterStates(states: FilterStateStore): void {
+  const dir = path.dirname(FILTER_FILE);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  fs.writeFileSync(FILTER_FILE, JSON.stringify(states));
 }
 
 const DATA_DIR = path.join(__dirname, "..", "data");
@@ -44,20 +72,22 @@ function pruneOldEntries(history: PriceHistory): void {
 
 /**
  * Poll current prices for a list of markets and append to history.
- * Returns the collected snapshots + history depth per market.
+ * Updates particle filter for each market to track filtered probability.
+ * Returns the collected snapshots + history depth + filtered probabilities per market.
  */
 export async function collectPrices(
   service: PolymarketService,
   conditionIds: string[],
 ): Promise<{
-  collected: { conditionId: string; snapshot: PriceSnapshot }[];
+  collected: { conditionId: string; snapshot: PriceSnapshot; filteredProbability?: number; divergence?: number }[];
   historyDepth: { [conditionId: string]: number };
   errors: { conditionId: string; error: string }[];
 }> {
   const history = loadHistory();
   pruneOldEntries(history);
 
-  const collected: { conditionId: string; snapshot: PriceSnapshot }[] = [];
+  const filterStates = loadFilterStates();
+  const collected: { conditionId: string; snapshot: PriceSnapshot; filteredProbability?: number; divergence?: number }[] = [];
   const errors: { conditionId: string; error: string }[] = [];
 
   for (const conditionId of conditionIds) {
@@ -93,7 +123,29 @@ export async function collectPrices(
         history[conditionId] = [];
       }
       history[conditionId].push(snapshot);
-      collected.push({ conditionId, snapshot });
+
+      // Update particle filter for this market
+      let filteredProbability: number | undefined;
+      let divergence: number | undefined;
+      try {
+        const pf = filterStates[conditionId]
+          ? PredictionMarketParticleFilter.deserialize(filterStates[conditionId])
+          : new PredictionMarketParticleFilter({
+              nParticles: 1000,
+              priorProb: 0.50,
+              processVol: 0.03,
+              obsNoise: 0.02,
+            });
+
+        const estimate = pf.update(yesPrice);
+        filteredProbability = Math.round(estimate.filteredProb * 10000) / 10000;
+        divergence = Math.round(estimate.divergence * 10000) / 10000;
+        filterStates[conditionId] = pf.serialize();
+      } catch {
+        // Non-fatal — particle filter update failed, continue without it
+      }
+
+      collected.push({ conditionId, snapshot, filteredProbability, divergence });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       errors.push({ conditionId, error: message });
@@ -101,6 +153,7 @@ export async function collectPrices(
   }
 
   saveHistory(history);
+  try { saveFilterStates(filterStates); } catch { /* non-fatal */ }
 
   const historyDepth: { [conditionId: string]: number } = {};
   for (const conditionId of conditionIds) {

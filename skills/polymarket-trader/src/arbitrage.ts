@@ -6,13 +6,13 @@ import type {
   ArbitrageResult,
 } from "./types";
 import { recordTrade } from "quant-core";
+import { feeAdjustedMaxAcceptable, computePairFees } from "./fees";
+import { estimateSlippage, estimateSellSlippage } from "./slippage";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const DEFAULT_LEG_TIMEOUT_MS = 3000;
 const DEFAULT_POLL_INTERVAL_MS = 500;
-/** Polymarket binary markets: Yes + No tokens always sum to 1.00 */
-const PAIR_SUM = 1.0;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -43,20 +43,31 @@ function bestAskFromBook(
  *
  * Mathematical basis:
  *   In a binary market, Yes + No tokens redeem for exactly $1.00 on resolution.
- *   If we can buy Yes at P1 and No at P2 where P1 + P2 < 1.00, we lock in
- *   guaranteed profit = 1.00 - P1 - P2 per unit regardless of outcome.
+ *   If we can buy Yes at P1 and No at P2 where P1 + P2 + fees < 1.00, we lock in
+ *   guaranteed profit = netPairSum - P1 - P2 per unit regardless of outcome.
+ *
+ * Fee model:
+ *   Dynamic taker fees scale with uncertainty: fee(p) = 0.063 × 2p(1-p).
+ *   Peak ~3.15% at p=0.50, declining toward 0 at extremes.
+ *   All price thresholds and P&L calculations are fee-adjusted.
+ *
+ * Slippage model:
+ *   Before sending FOK orders, the engine walks the order book to estimate
+ *   the volume-weighted average fill price (VWAP). Orders are only sent if
+ *   the VWAP (not just the best ask) falls within the profit window.
  *
  * Execution sequence:
  *   1. Place Leg 1 as a GTC limit order at `firstLegPrice`
  *   2. Wait for fill confirmation (poll open orders)
  *   3. Start `legTimeoutMs` timer — during this window:
  *      a. Poll order book for the opposite outcome every `pollIntervalMs`
- *      b. Compute Max_Acceptable_Price = 1.00 - P_filled - margin
- *      c. If best ask ≤ Max_Acceptable_Price → send FOK market order to lock pair
+ *      b. Compute fee-adjusted Max_Acceptable_Price
+ *      c. Estimate slippage via order book walk
+ *      d. If VWAP ≤ Max_Acceptable_Price → send FOK market order to lock pair
  *   4. If timer expires without completing the pair → BAILOUT:
  *      a. Cancel any pending leg 2 order
- *      b. Immediately market-sell leg 1 tokens to flatten position
- *      c. Accept the fractional loss from spread/slippage
+ *      b. Estimate sell slippage, then market-sell leg 1 tokens to flatten
+ *      c. Accept the fractional loss from spread/slippage/fees
  */
 export async function executePairArbitrage(
   service: PolymarketService,
@@ -74,7 +85,7 @@ export async function executePairArbitrage(
   } = params;
 
   const secondLeg = oppositeOutcome(firstLeg);
-  const maxAcceptablePrice = PAIR_SUM - firstLegPrice - margin;
+  const maxAcceptablePrice = feeAdjustedMaxAcceptable(firstLegPrice, margin, amount);
 
   let phase: ArbitragePhase = "LEG1_PENDING";
   let leg1: ArbitrageLegStatus = {
@@ -86,18 +97,22 @@ export async function executePairArbitrage(
   };
   let leg2: ArbitrageLegStatus | null = null;
   let bailoutSell: { orderId: string; price: number; size: number } | undefined;
+  let feeBreakdown: ArbitrageResult["feeBreakdown"];
+  let slippageBreakdown: ArbitrageResult["slippageBreakdown"];
 
   const makeResult = (summary: string): ArbitrageResult => ({
     phase,
     leg1,
     leg2,
     pairComplete: phase === "COMPLETE",
-    netPnl: calculateNetPnl(leg1, leg2, bailoutSell),
+    netPnl: calculateNetPnl(leg1, leg2, bailoutSell, amount),
     maxAcceptablePrice: Math.round(maxAcceptablePrice * 10000) / 10000,
     bailoutTriggered: phase === "FLAT",
     bailoutSell,
     elapsedMs: Date.now() - startTime,
     summary,
+    feeBreakdown,
+    slippageBreakdown,
   });
 
   // ── Validate params ───────────────────────────────────────────────────────
@@ -105,7 +120,7 @@ export async function executePairArbitrage(
     phase = "FAILED";
     return makeResult(
       `Invalid setup: maxAcceptablePrice=${maxAcceptablePrice.toFixed(4)} ≤ 0. ` +
-      `firstLegPrice (${firstLegPrice}) + margin (${margin}) ≥ 1.00. No room for profit.`,
+      `firstLegPrice (${firstLegPrice}) + margin (${margin}) + fees exceed 1.00. No room for profit.`,
     );
   }
 
@@ -187,9 +202,9 @@ export async function executePairArbitrage(
   }
 
   // ── Step 3: Dynamic Hedging Window ────────────────────────────────────────
-  // P_filled is now locked. Compute the ceiling for leg 2.
+  // P_filled is now locked. Compute the fee-adjusted ceiling for leg 2.
   const pFilled = leg1.price;
-  const dynamicMaxPrice = PAIR_SUM - pFilled - margin;
+  const dynamicMaxPrice = feeAdjustedMaxAcceptable(pFilled, margin, amount);
   phase = "HEDGING";
 
   recordTrade({
@@ -220,9 +235,18 @@ export async function executePairArbitrage(
       const bestAsk = bestAskFromBook(orderBook);
 
       if (bestAsk <= dynamicMaxPrice) {
-        // Best ask is within our profit window — cross the spread with FOK
+        // Best ask is within our profit window — estimate actual fill via slippage model
+        const slippage = estimateSlippage(orderBook.asks, amount);
+
+        // Gate on VWAP, not just best ask — large orders eat through levels
+        if (!slippage.fullyFillable || slippage.vwap > dynamicMaxPrice) {
+          // Slippage pushes effective price beyond our limit — keep polling
+          await sleep(pollIntervalMs);
+          continue;
+        }
+
         phase = "LEG2_FILLED";
-        const leg2Size = amount / bestAsk;
+        const leg2Size = amount / slippage.vwap;
 
         try {
           const leg2Result = await service.marketBuy({
@@ -236,13 +260,24 @@ export async function executePairArbitrage(
           leg2 = {
             outcome: secondLeg,
             orderId: leg2Result.orderId,
-            price: bestAsk,
+            price: slippage.vwap,
             size: leg2Result.size || leg2Size,
             status: "filled",
           };
 
           phase = "COMPLETE";
-          const lockedSpread = PAIR_SUM - pFilled - bestAsk;
+          const { netPairSum, leg1Fee, leg2Fee } = computePairFees(pFilled, slippage.vwap, amount);
+          const lockedSpread = netPairSum - pFilled - slippage.vwap;
+
+          feeBreakdown = {
+            leg1Fee: leg1Fee.feeAmount,
+            leg2Fee: leg2Fee.feeAmount,
+            totalFees: leg1Fee.feeAmount + leg2Fee.feeAmount,
+          };
+          slippageBreakdown = {
+            leg2SlippageBps: slippage.slippageBps,
+            leg2Vwap: slippage.vwap,
+          };
 
           recordTrade({
             skill: "polymarket",
@@ -250,7 +285,7 @@ export async function executePairArbitrage(
             conditionId: marketConditionId,
             side: "BUY",
             amount,
-            price: bestAsk,
+            price: slippage.vwap,
             status: "submitted",
             pnl: lockedSpread * leg1.size,
             metadata: {
@@ -258,12 +293,15 @@ export async function executePairArbitrage(
               outcome: secondLeg,
               phase: "COMPLETE",
               lockedSpread,
+              feeBreakdown,
+              slippageBps: slippage.slippageBps,
             },
           });
 
           return makeResult(
-            `Pair complete! Bought ${firstLeg}@${pFilled.toFixed(4)} + ${secondLeg}@${bestAsk.toFixed(4)} = ` +
-            `${(pFilled + bestAsk).toFixed(4)}. Locked spread: ${lockedSpread.toFixed(4)} per unit.`,
+            `Pair complete! Bought ${firstLeg}@${pFilled.toFixed(4)} + ${secondLeg}@${slippage.vwap.toFixed(4)} = ` +
+            `${(pFilled + slippage.vwap).toFixed(4)}. Locked spread: ${lockedSpread.toFixed(4)}/unit ` +
+            `(fees: $${feeBreakdown.totalFees.toFixed(4)}, slippage: ${slippage.slippageBps}bps).`,
           );
         } catch (err) {
           // FOK failed (likely filled away) — continue polling
@@ -304,6 +342,22 @@ export async function executePairArbitrage(
   });
 
   try {
+    // Estimate bailout slippage before selling
+    try {
+      const { orderBook: bailoutBook } = await service.getOrderBookForToken(
+        marketConditionId,
+        firstLeg,
+      );
+      const sellSlippage = estimateSellSlippage(bailoutBook.bids, leg1.size);
+      slippageBreakdown = {
+        leg2SlippageBps: 0,
+        leg2Vwap: 0,
+        bailoutSlippageBps: sellSlippage.slippageBps,
+      };
+    } catch {
+      // Non-fatal — proceed with bailout regardless
+    }
+
     // Flatten position: market-sell the filled leg 1 tokens
     const sellResult = await service.sellPosition(marketConditionId, firstLeg);
 
@@ -340,22 +394,24 @@ export async function executePairArbitrage(
   }
 }
 
-// ─── P&L Calculation ────────────────────────────────────────────────────────
+// ─── P&L Calculation (Fee-Adjusted) ──────────────────────────────────────────
 
 function calculateNetPnl(
   leg1: ArbitrageLegStatus,
   leg2: ArbitrageLegStatus | null,
   bailoutSell?: { orderId: string; price: number; size: number },
+  notional?: number,
 ): number {
   if (leg1.status !== "filled") return 0;
 
   const leg1Cost = leg1.price * leg1.size;
 
   if (leg2 && leg2.status === "filled") {
-    // Pair complete: profit = (1.00 * minSize) - leg1Cost - leg2Cost
+    // Pair complete: profit = (netPairSum * minSize) - leg1Cost - leg2Cost
     const leg2Cost = leg2.price * leg2.size;
     const minSize = Math.min(leg1.size, leg2.size);
-    return Math.round((PAIR_SUM * minSize - leg1Cost - leg2Cost) * 10000) / 10000;
+    const { netPairSum } = computePairFees(leg1.price, leg2.price, notional || leg1Cost);
+    return Math.round((netPairSum * minSize - leg1Cost - leg2Cost) * 10000) / 10000;
   }
 
   if (bailoutSell) {

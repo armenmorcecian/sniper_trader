@@ -43,32 +43,63 @@ IMPORTANT:
 | `trade_journal` | `action` (recent/daily/stats), `limit`, `since`, `date` | Query trade history, daily P&L summaries, win/loss stats. Actions: `recent` (last N trades), `daily` (day summary + today's count), `stats` (win rate, P&L, blocked count). |
 | `performance_report` | `period` (daily/weekly/monthly/all-time), `skill` (alpaca/polymarket) | Performance analytics: Sharpe ratio, max drawdown, win rate, profit factor, equity curve stats. Computed from trade journal + equity snapshots. |
 | `execute_pair_arbitrage` | `marketConditionId`, `firstLeg`, `amount`, `firstLegPrice`, `margin`, `legTimeoutMs`, `pollIntervalMs` | Two-legged pair arbitrage on binary markets. Places Leg 1 at limit, dynamically hedges Leg 2 within timeout, bails out if pair incomplete. Full audit trail. |
+| `simulate_arbitrage` | `marketConditionId`, `firstLeg`, `amount`, `firstLegPrice`, `margin`, `legTimeoutMs`, `nPaths` | Dry-run Monte Carlo simulation BEFORE execution. Returns expected P&L, profit/bailout probabilities, recommendation (EXECUTE/SKIP/REDUCE_SIZE). Call this before execute_pair_arbitrage. |
+| `edge_detection` | `conditionId`, `outcome` | Particle filter edge detection. Compares smoothed "true" probability vs raw market price. High divergence = mispricing opportunity. Needs 5+ price snapshots. |
+| `backtest_arbitrage` | `trueProb`, `amount`, `margin`, `legTimeoutMs`, `pollIntervalMs`, `nTrials` | Agent-based backtesting of pair arb strategy. Simulates order book with informed/noise/MM agents, runs N trials. Returns completion rate, avg P&L, Sharpe, max drawdown, win rate. |
+| `portfolio_correlation` | `conditionIds` (array) | Copula-based tail dependence analysis across positions. Compares Gaussian vs Student-t models to quantify how extreme co-movements increase portfolio risk. Needs 5+ snapshots per market. |
 
 ## Pair Arbitrage (Leg-Risk & Bailout)
 
 Executes a two-legged arbitrage on binary Polymarket markets where Yes + No tokens always redeem for $1.00.
 
 **Mathematical basis:**
-- If `P_yes + P_no < 1.00`, buying both sides locks in guaranteed profit
-- `Max_Acceptable_Price(Leg2) = 1.00 - P_filled(Leg1) - margin`
+- If `P_yes + P_no + fees < 1.00`, buying both sides locks in guaranteed profit
+- Dynamic taker fees: `fee(p) = 0.063 × 2p(1-p)` — peak ~3.15% at p=0.50, declining toward extremes
+- `Max_Acceptable_Price(Leg2) = netPairSum - P_filled(Leg1) - margin` (fee-adjusted, NOT simply `1.0 - P1 - margin`)
+
+**Recommended workflow:**
+1. Call `simulate_arbitrage` first — dry-run MC simulation to evaluate expected P&L
+2. If recommendation is `EXECUTE`, proceed with `execute_pair_arbitrage`
+3. If recommendation is `SKIP` or `REDUCE_SIZE`, adjust parameters or skip the trade
 
 **Execution sequence:**
 1. Place Leg 1 as GTC limit order at `firstLegPrice`
 2. Wait for fill confirmation (poll order status)
 3. Start `legTimeoutMs` timer (default: 3000ms)
 4. During hedge window: poll order book every `pollIntervalMs` (default: 500ms)
-5. If best ask for opposite outcome ≤ `Max_Acceptable_Price` → send FOK market order
-6. **Bailout:** If timeout expires without pair completion → market-sell Leg 1 to flatten
+5. Walk order book to compute VWAP (volume-weighted average price) for full order size
+6. If VWAP ≤ fee-adjusted `Max_Acceptable_Price` → send FOK market order
+7. **Bailout:** If timeout expires without pair completion → estimate sell slippage, then market-sell Leg 1 to flatten
 
 **Example:**
 ```
+polymarket-trader simulate_arbitrage '{"marketConditionId":"0xabc...","firstLeg":"Yes","amount":5,"firstLegPrice":0.45,"margin":0.02}'
 polymarket-trader execute_pair_arbitrage '{"marketConditionId":"0xabc...","firstLeg":"Yes","amount":5,"firstLegPrice":0.45,"margin":0.02}'
 ```
-If Yes fills at 0.45, then `Max_Acceptable_Price(No) = 1.00 - 0.45 - 0.02 = 0.53`. If No's best ask ≤ 0.53, the engine crosses the spread to lock in ≥ $0.02/unit profit.
+If Yes fills at 0.45 with fee rate ~3.1%, then `netPairSum ≈ 0.938`, `Max_Acceptable_Price(No) ≈ 0.938 - 0.45 - 0.02 = 0.468`. This is lower than the naive `1.0 - 0.45 - 0.02 = 0.53` because fees reduce the profit window.
 
 **Pre-checks:** Daily loss circuit breaker, API health, balance validation (needs 2× amount for both legs).
 
-**Return fields:** `phase`, `leg1`, `leg2`, `pairComplete`, `netPnl`, `maxAcceptablePrice`, `bailoutTriggered`, `bailoutSell`, `elapsedMs`, `summary`.
+**Return fields:** `phase`, `leg1`, `leg2`, `pairComplete`, `netPnl`, `maxAcceptablePrice`, `bailoutTriggered`, `bailoutSell`, `elapsedMs`, `summary`, `feeBreakdown`, `slippageBreakdown`.
+
+## Simulation & Edge Detection Tools
+
+### simulate_arbitrage (Pre-Trade Gate)
+Runs 5000 (configurable) Monte Carlo simulation paths incorporating real order book state, dynamic fees, VWAP slippage, and bailout probability. Returns:
+- `expectedPnl` / `pnlStdError` — average P&L across paths
+- `profitProbability` / `bailoutProbability` — likelihood of success vs timeout
+- `worstCaseScenario` / `bestCaseScenario` — 5th/95th percentile P&L
+- `recommendation` — `EXECUTE`, `SKIP`, or `REDUCE_SIZE`
+- `estimatedFees` / `estimatedSlippage` — average cost per trade
+
+### edge_detection (Particle Filter)
+Sequential Monte Carlo filter that smooths noisy market prices to estimate the "true" probability. When the filtered probability diverges significantly from the raw market price, it signals a mispricing opportunity. Returns `filteredProbability`, `divergence`, `ci95`, `signal` (UNDERPRICED/OVERPRICED/NEUTRAL).
+
+### backtest_arbitrage (Agent-Based Model)
+Simulates a Polymarket-like order book with three agent types (informed/noise/market-maker) following Kyle's (1985) lambda price impact model. Runs N arbitrage trials against the synthetic environment. Returns `completionRate`, `avgPnl`, `sharpeRatio`, `maxDrawdown`, `winRate`.
+
+### portfolio_correlation (Copula Analysis)
+Builds a Kendall tau correlation matrix from price histories, then runs Student-t copula simulation to estimate tail dependence. Returns `correlationMatrix`, `portfolioRisk` (expected P&L, worst-case joint loss), and risk `insight` (HIGH/MODERATE/LOW correlation).
 
 ## Key Technical Gotchas
 
@@ -110,4 +141,7 @@ All have sensible defaults — the system works without setting them.
 
 - **Equity Snapshots**: `check_vital_signs` automatically records equity snapshots to SQLite (deduplicated to 5-min intervals). Used by `performance_report` for Sharpe ratio and max drawdown calculations.
 - **Structured Logging**: Every tool call is logged with timestamp, params, result summary, latency, and status to the `tool_calls` table. Logging never breaks tool execution (wrapped in try/catch).
-- **Performance Report**: Use `performance_report` to get Sharpe ratio, max drawdown, win rate, profit factor, and equity curve stats for any time period.
+- **Performance Report**: Use `performance_report` to get Sharpe ratio, max drawdown, win rate, profit factor, equity curve stats, and **Brier score calibration** for any time period.
+- **Particle Filter Tracking**: `collect_prices` automatically updates a particle filter per market, storing serialized state in `data/particle-filters.json`. Returns `filteredProbability` and `divergence` alongside each snapshot.
+- **MC Simulation Gate**: `execute_pair_arbitrage` runs a pre-trade Monte Carlo simulation (3000 paths). Trades with `SKIP` recommendation are blocked and recorded to the journal with `MC_SIMULATION_SKIP` error code.
+- **Calibration Log**: Prediction probabilities can be logged and resolved against outcomes. `performance_report` includes Brier score and calibration-by-bucket metrics.
