@@ -301,7 +301,7 @@ export interface ArbitrageResult {
   pairComplete: boolean;
   /** Net P&L of the arbitrage (positive = profit, negative = bailout cost) */
   netPnl: number;
-  /** Maximum acceptable price for leg 2: 1.00 - P_filled - margin */
+  /** Maximum acceptable price for leg 2 (fee-adjusted) */
   maxAcceptablePrice: number;
   /** Whether bailout was triggered */
   bailoutTriggered: boolean;
@@ -311,6 +311,12 @@ export interface ArbitrageResult {
   elapsedMs: number;
   /** Human-readable summary */
   summary: string;
+  /** Fee breakdown per leg (present when pair completes or is attempted) */
+  feeBreakdown?: { leg1Fee: number; leg2Fee: number; totalFees: number };
+  /** Slippage estimates from order book walk */
+  slippageBreakdown?: { leg2SlippageBps: number; leg2Vwap: number; bailoutSlippageBps?: number };
+  /** Pre-trade simulation result (present when MC gate runs) */
+  simulationResult?: { expectedPnl: number; profitProbability: number; recommendation: string };
 }
 
 // ─── Bet Sizing ─────────────────────────────────────────────────────────────
