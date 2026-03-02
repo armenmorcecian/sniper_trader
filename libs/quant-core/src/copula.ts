@@ -13,6 +13,10 @@
 //   with zero tail dependence is catastrophically wrong. For prediction market
 //   portfolios, the t-copula shows 2-5x higher probability of joint extreme
 //   outcomes than Gaussian.
+//
+//   IMPORTANT: Static t-copula parameters (degrees of freedom) suffer the same
+//   estimation weakness as Gaussian — they don't adapt to changing regimes.
+//   Use calibrateCopulaDf() for production to estimate df from observed data.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -360,6 +364,93 @@ function pearsonR(a: number[], b: number[]): number {
   return (n * sumAB - sumA * sumB) / denom;
 }
 
+// ─── Copula Degrees-of-Freedom Calibration ──────────────────────────────────
+
+/**
+ * Estimate optimal t-copula degrees of freedom from price histories.
+ * Compares theoretical tail dependence at each candidate df against empirical
+ * joint tail frequencies from rolling windows.
+ *
+ * @param priceHistories - Array of price series (one per market)
+ * @param windowSize     - Rolling window size (default: 20)
+ * @returns Optimal degrees of freedom (integer, range 2-30)
+ */
+export function calibrateCopulaDf(
+  priceHistories: number[][],
+  windowSize: number = 20,
+): number {
+  const d = priceHistories.length;
+  if (d < 2) return 4;
+
+  const minLen = Math.min(...priceHistories.map(h => h.length));
+  if (minLen < windowSize + 5) return 4;
+
+  // Compute returns
+  const returns: number[][] = priceHistories.map(h => {
+    const r: number[] = [];
+    for (let i = 1; i < minLen; i++) {
+      r.push(h[i] - h[i - 1]);
+    }
+    return r;
+  });
+
+  // Empirical joint tail frequency via rolling windows
+  const tailThreshold = 0.10;
+  let jointTailCount = 0;
+  let totalWindows = 0;
+
+  for (let start = 0; start <= returns[0].length - windowSize; start++) {
+    totalWindows++;
+
+    const inTail: boolean[] = new Array(d);
+    for (let m = 0; m < d; m++) {
+      const windowReturns = returns[m].slice(start, start + windowSize);
+      const sorted = [...windowReturns].sort((a, b) => a - b);
+      const cutoff = sorted[Math.floor(windowSize * tailThreshold)];
+      inTail[m] = returns[m][start + windowSize - 1] <= cutoff;
+    }
+
+    if (inTail.every(x => x)) {
+      jointTailCount++;
+    }
+  }
+
+  const empiricalTailFreq = totalWindows > 0 ? jointTailCount / totalWindows : 0;
+
+  // Average pairwise correlation
+  const corrMatrix = buildCorrelationMatrix(
+    priceHistories.map(h => h.slice(0, minLen)),
+  );
+  let sumCorr = 0, countCorr = 0;
+  for (let i = 0; i < d; i++) {
+    for (let j = i + 1; j < d; j++) {
+      sumCorr += corrMatrix[i][j];
+      countCorr++;
+    }
+  }
+  const avgCorr = countCorr > 0 ? sumCorr / countCorr : 0;
+
+  // Grid search: find df that best matches empirical tail frequency
+  const dfCandidates = [2, 3, 4, 5, 6, 8, 10, 15, 20, 30];
+  let bestDf = 4;
+  let bestError = Infinity;
+
+  for (const nu of dfCandidates) {
+    const rhoClamp = Math.max(avgCorr, 0.001);
+    const tdArg = -Math.sqrt((nu + 1) * (1 - rhoClamp) / (1 + rhoClamp));
+    const theoreticalTailDep = 2 * studentTCdf(tdArg, nu + 1);
+    const theoreticalJointTail = Math.pow(theoreticalTailDep, d - 1) * tailThreshold;
+
+    const error = Math.abs(theoreticalJointTail - empiricalTailFreq);
+    if (error < bestError) {
+      bestError = error;
+      bestDf = nu;
+    }
+  }
+
+  return bestDf;
+}
+
 // ─── Portfolio Risk Assessment ──────────────────────────────────────────────
 
 /**
@@ -373,6 +464,7 @@ export function assessPortfolioRisk(
   positions: Array<{ prob: number; size: number; expectedPnl: number }>,
   corrMatrix: number[][],
   copulaType: "gaussian" | "t" | "clayton" = "t",
+  degreesOfFreedom?: number,
 ): PortfolioRisk {
   const d = positions.length;
   if (d === 0) {
@@ -389,7 +481,7 @@ export function assessPortfolioRisk(
   } else if (copulaType === "clayton") {
     copulaResult = claytonCopula(probs, undefined, nSamples);
   } else {
-    copulaResult = tCopula(probs, corrMatrix, 4, nSamples);
+    copulaResult = tCopula(probs, corrMatrix, degreesOfFreedom ?? 4, nSamples);
   }
 
   // Compute portfolio P&L distribution

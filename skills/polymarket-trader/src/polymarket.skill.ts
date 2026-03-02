@@ -13,7 +13,7 @@ import {
   checkCircuitBreaker, checkConcentration, isApiAvailable,
   recordTrade, queryTrades, getDailySummary, getTradesToday, recordEquitySnapshot,
   PredictionMarketParticleFilter, getCalibrationMetrics,
-  buildCorrelationMatrix, assessPortfolioRisk,
+  buildCorrelationMatrix, assessPortfolioRisk, calibrateCopulaDf,
 } from "quant-core";
 import { getPerformanceMetrics } from "quant-core/src/performance";
 import type { TradeEntry } from "quant-core";
@@ -853,17 +853,26 @@ export const tools = [
           };
         }
 
-        // Build particle filter from price history
-        const pf = new PredictionMarketParticleFilter({
-          nParticles: 2000,
-          priorProb: 0.50,
-          processVol: 0.03,
-          obsNoise: 0.02,
-        });
-
+        // Build particle filter from price history with calibrated hyperparameters
         const prices = snapshots.map(s =>
           params.outcome === "Yes" ? s.yesPrice : s.noPrice,
         );
+
+        // Calibrate processVol and obsNoise from observed data
+        let pfProcessVol = 0.03;
+        let pfObsNoise = 0.02;
+        if (prices.length >= 20) {
+          const calibrated = PredictionMarketParticleFilter.calibrate(prices, 0.50, 500);
+          pfProcessVol = calibrated.processVol;
+          pfObsNoise = calibrated.obsNoise;
+        }
+
+        const pf = new PredictionMarketParticleFilter({
+          nParticles: 2000,
+          priorProb: 0.50,
+          processVol: pfProcessVol,
+          obsNoise: pfObsNoise,
+        });
 
         // Process all historical observations
         for (const price of prices) {
@@ -969,8 +978,11 @@ export const tools = [
           };
         });
 
+        // Calibrate copula degrees of freedom from observed data
+        const calibratedDf = calibrateCopulaDf(priceHistories);
+
         // Assess risk under t-copula (captures tail dependence)
-        const risk = assessPortfolioRisk(positions, corrMatrix, "t");
+        const risk = assessPortfolioRisk(positions, corrMatrix, "t", calibratedDf);
 
         return {
           markets: marketInfo,

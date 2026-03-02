@@ -28,6 +28,10 @@ export interface ParticleFilterConfig {
   obsNoise: number;
   /** Initial probability estimate (default: 0.50) */
   priorProb: number;
+  /** ISO timestamp when the market expires (optional — enables near-expiry vol scaling) */
+  expiryTime?: string;
+  /** Minimum vol fraction near expiry, 0-1 (default: 0.1 = 10% of processVol) */
+  minVolFraction?: number;
 }
 
 export interface ParticleFilterState {
@@ -110,15 +114,29 @@ export class PredictionMarketParticleFilter {
   /**
    * Incorporate a new observation (market price) and return updated estimate.
    */
-  update(observedPrice: number): FilterEstimate {
+  update(observedPrice: number, currentTime?: string): FilterEstimate {
     const N = this.config.nParticles;
-    const { processVol, obsNoise } = this.config;
+    const { obsNoise } = this.config;
+    let effectiveVol = this.config.processVol;
     this._lastObserved = observedPrice;
     this._observationCount++;
 
+    // Near-expiry vol scaling: linearly reduce processVol as expiry approaches
+    if (currentTime && this.config.expiryTime) {
+      const now = new Date(currentTime).getTime();
+      const expiry = new Date(this.config.expiryTime).getTime();
+      const hoursToExpiry = (expiry - now) / (1000 * 60 * 60);
+
+      if (hoursToExpiry > 0 && hoursToExpiry < 24) {
+        const minFrac = this.config.minVolFraction ?? 0.1;
+        const scale = minFrac + (1 - minFrac) * (hoursToExpiry / 24);
+        effectiveVol = this.config.processVol * scale;
+      }
+    }
+
     // 1. Propagate: random walk in logit space
     for (let i = 0; i < N; i++) {
-      this.logitParticles[i] += randn() * processVol;
+      this.logitParticles[i] += randn() * effectiveVol;
     }
 
     // 2. Reweight: likelihood of observation given each particle
@@ -223,6 +241,81 @@ export class PredictionMarketParticleFilter {
     }
 
     return pf;
+  }
+
+  // ─── Marginal Likelihood ─────────────────────────────────────────────────
+
+  /**
+   * Compute marginal likelihood P(observation | model) without mutating state.
+   * Used for hyperparameter calibration via evidence maximization.
+   */
+  marginalLikelihood(observation: number): number {
+    const N = this.config.nParticles;
+    const { obsNoise } = this.config;
+
+    // Log-sum-exp for numerical stability
+    const logTerms = new Float64Array(N);
+    let maxLog = -Infinity;
+
+    for (let i = 0; i < N; i++) {
+      const probParticle = sigmoid(this.logitParticles[i]);
+      const logWeight = Math.log(this.weights[i] + 1e-300);
+      const logNormal = -0.5 * ((observation - probParticle) / obsNoise) ** 2
+                        - Math.log(obsNoise) - 0.5 * Math.log(2 * Math.PI);
+      logTerms[i] = logWeight + logNormal;
+      if (logTerms[i] > maxLog) maxLog = logTerms[i];
+    }
+
+    let sumExp = 0;
+    for (let i = 0; i < N; i++) {
+      sumExp += Math.exp(logTerms[i] - maxLog);
+    }
+
+    return maxLog + Math.log(sumExp);
+  }
+
+  // ─── Calibration ─────────────────────────────────────────────────────────
+
+  /**
+   * Empirical Bayes calibration: grid search over processVol × obsNoise
+   * to find the pair that maximizes marginal likelihood of the observed data.
+   *
+   * @param prices     - Observed price sequence (≥5 points recommended)
+   * @param priorProb  - Initial probability estimate (default: 0.50)
+   * @param nParticles - Particles per candidate filter (default: 500)
+   */
+  static calibrate(
+    prices: number[],
+    priorProb?: number,
+    nParticles?: number,
+  ): { processVol: number; obsNoise: number; logLikelihood: number } {
+    const processVolCandidates = [0.005, 0.01, 0.02, 0.03, 0.05, 0.08, 0.12];
+    const obsNoiseCandidates = [0.005, 0.01, 0.02, 0.03, 0.05, 0.08];
+
+    let best = { processVol: 0.03, obsNoise: 0.02, logLikelihood: -Infinity };
+
+    for (const pv of processVolCandidates) {
+      for (const on of obsNoiseCandidates) {
+        const pf = new PredictionMarketParticleFilter({
+          nParticles: nParticles ?? 500,
+          processVol: pv,
+          obsNoise: on,
+          priorProb: priorProb ?? 0.50,
+        });
+
+        let totalLogLik = 0;
+        for (const price of prices) {
+          totalLogLik += pf.marginalLikelihood(price);
+          pf.update(price);
+        }
+
+        if (totalLogLik > best.logLikelihood) {
+          best = { processVol: pv, obsNoise: on, logLikelihood: totalLogLik };
+        }
+      }
+    }
+
+    return best;
   }
 
   // ─── Private Methods ──────────────────────────────────────────────────────

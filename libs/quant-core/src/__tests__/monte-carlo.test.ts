@@ -4,8 +4,12 @@ import {
   antitheticSamples,
   stratifiedSamples,
   brierScore,
+  brierSkillScore,
   simulateBinaryContract,
+  simulatePredictionContract,
   importanceSamplingEstimate,
+  logit,
+  sigmoid,
 } from "../monte-carlo";
 
 describe("antitheticSamples", () => {
@@ -178,5 +182,233 @@ describe("simulateBinaryContract", () => {
     });
 
     expect(itm.estimate).toBeGreaterThan(otm.estimate);
+  });
+});
+
+describe("logit / sigmoid", () => {
+  it("sigmoid(logit(p)) round-trips", () => {
+    for (const p of [0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99]) {
+      expect(sigmoid(logit(p))).toBeCloseTo(p, 8);
+    }
+  });
+
+  it("logit maps 0.5 to 0", () => {
+    expect(logit(0.5)).toBeCloseTo(0, 10);
+  });
+
+  it("sigmoid maps 0 to 0.5", () => {
+    expect(sigmoid(0)).toBe(0.5);
+  });
+
+  it("sigmoid is bounded in (0,1) for extreme inputs", () => {
+    expect(sigmoid(-100)).toBeGreaterThan(0);
+    expect(sigmoid(-100)).toBeLessThan(0.001);
+    expect(sigmoid(100)).toBeGreaterThan(0.999);
+    expect(sigmoid(100)).toBeLessThanOrEqual(1);
+    // At moderate inputs, strictly less than 1
+    expect(sigmoid(10)).toBeLessThan(1);
+    expect(sigmoid(10)).toBeGreaterThan(0.999);
+  });
+
+  it("logit clamps near 0 and 1", () => {
+    expect(logit(0)).toBeLessThan(-20);
+    expect(logit(1)).toBeGreaterThan(20);
+    expect(isFinite(logit(0))).toBe(true);
+    expect(isFinite(logit(1))).toBe(true);
+  });
+});
+
+describe("simulatePredictionContract", () => {
+  it("all terminal probabilities bounded in (0,1)", () => {
+    const result = simulatePredictionContract({
+      currentProb: 0.50,
+      volatility: 0.50, // High vol
+      timeToExpiry: 1.0,
+      nPaths: 5000,
+      seed: 42,
+    });
+
+    // All quantiles must be in (0,1)
+    for (const q of result.terminalQuantiles) {
+      expect(q).toBeGreaterThan(0);
+      expect(q).toBeLessThan(1);
+    }
+    expect(result.impliedProbYes).toBeGreaterThan(0);
+    expect(result.impliedProbYes).toBeLessThan(1);
+  });
+
+  it("bounded even at extreme vol levels", () => {
+    const result = simulatePredictionContract({
+      currentProb: 0.50,
+      volatility: 2.0, // Very high vol
+      timeToExpiry: 1.0,
+      nPaths: 5000,
+      seed: 42,
+    });
+
+    for (const q of result.terminalQuantiles) {
+      expect(q).toBeGreaterThan(0);
+      expect(q).toBeLessThan(1);
+    }
+  });
+
+  it("Brownian bridge converges near terminal", () => {
+    const bridged = simulatePredictionContract({
+      currentProb: 0.50,
+      volatility: 0.30,
+      timeToExpiry: 0.01, // Very near expiry
+      nPaths: 5000,
+      seed: 42,
+      useBrownianBridge: true,
+      terminalProb: 1.0,
+    });
+
+    const standard = simulatePredictionContract({
+      currentProb: 0.50,
+      volatility: 0.30,
+      timeToExpiry: 0.01,
+      nPaths: 5000,
+      seed: 42,
+    });
+
+    // Bridged should be closer to 1.0 than standard
+    expect(bridged.impliedProbYes).toBeGreaterThan(standard.impliedProbYes);
+  });
+
+  it("higher vol produces wider spread", () => {
+    const lowVol = simulatePredictionContract({
+      currentProb: 0.50,
+      volatility: 0.10,
+      timeToExpiry: 0.5,
+      nPaths: 10000,
+      seed: 42,
+    });
+
+    const highVol = simulatePredictionContract({
+      currentProb: 0.50,
+      volatility: 0.80,
+      timeToExpiry: 0.5,
+      nPaths: 10000,
+      seed: 42,
+    });
+
+    const lowSpread = lowVol.terminalQuantiles[4] - lowVol.terminalQuantiles[0];
+    const highSpread = highVol.terminalQuantiles[4] - highVol.terminalQuantiles[0];
+    expect(highSpread).toBeGreaterThan(lowSpread);
+  });
+
+  it("handles extreme probabilities (0.01, 0.99)", () => {
+    for (const prob of [0.01, 0.99]) {
+      const result = simulatePredictionContract({
+        currentProb: prob,
+        volatility: 0.30,
+        timeToExpiry: 0.5,
+        nPaths: 5000,
+        seed: 42,
+      });
+
+      for (const q of result.terminalQuantiles) {
+        expect(q).toBeGreaterThan(0);
+        expect(q).toBeLessThan(1);
+      }
+    }
+  });
+
+  it("zero time-to-expiry returns current prob", () => {
+    const result = simulatePredictionContract({
+      currentProb: 0.65,
+      volatility: 0.30,
+      timeToExpiry: 0,
+      nPaths: 5000,
+      seed: 42,
+    });
+
+    // With T=0, sigma*sqrt(0)=0, all paths land on currentProb
+    expect(result.impliedProbYes).toBeCloseTo(0.65, 2);
+    expect(result.terminalQuantiles[2]).toBeCloseTo(0.65, 2); // Median
+  });
+
+  it("returns correct nPaths", () => {
+    const result = simulatePredictionContract({
+      currentProb: 0.50,
+      volatility: 0.20,
+      timeToExpiry: 0.5,
+      nPaths: 3000,
+      seed: 42,
+    });
+    expect(result.nPaths).toBe(3000);
+  });
+
+  it("quantiles are monotonically ordered", () => {
+    const result = simulatePredictionContract({
+      currentProb: 0.50,
+      volatility: 0.30,
+      timeToExpiry: 0.5,
+      nPaths: 10000,
+      seed: 42,
+    });
+
+    for (let i = 0; i < result.terminalQuantiles.length - 1; i++) {
+      expect(result.terminalQuantiles[i]).toBeLessThanOrEqual(result.terminalQuantiles[i + 1]);
+    }
+  });
+});
+
+describe("brierSkillScore", () => {
+  it("BSS = 0 for naive base-rate predictor", () => {
+    // Predicting the mean outcome = the reference model
+    const outcomes = [1, 0, 1, 0, 1, 0, 1, 0, 1, 0];
+    const predictions = outcomes.map(() => 0.5); // base rate = 0.5
+    expect(brierSkillScore(predictions, outcomes)).toBeCloseTo(0, 2);
+  });
+
+  it("BSS > 0 for skilled predictor", () => {
+    const outcomes =    [1, 0, 1, 0, 1, 0, 1, 0];
+    const predictions = [0.9, 0.1, 0.8, 0.2, 0.9, 0.1, 0.8, 0.2];
+    expect(brierSkillScore(predictions, outcomes)).toBeGreaterThan(0);
+  });
+
+  it("BSS < 0 for anti-skilled predictor", () => {
+    const outcomes =    [1, 0, 1, 0, 1, 0, 1, 0];
+    const predictions = [0.1, 0.9, 0.2, 0.8, 0.1, 0.9, 0.2, 0.8]; // Wrong direction
+    expect(brierSkillScore(predictions, outcomes)).toBeLessThan(0);
+  });
+
+  it("BSS = 1 for perfect predictor", () => {
+    const outcomes =    [1, 0, 1, 0];
+    const predictions = [1, 0, 1, 0];
+    expect(brierSkillScore(predictions, outcomes)).toBeCloseTo(1, 4);
+  });
+
+  it("exposes rare-event weakness of raw Brier score", () => {
+    // A rare event (2% base rate) — naive predictor always says 0.02
+    const outcomes: number[] = new Array(100).fill(0);
+    outcomes[0] = 1;
+    outcomes[50] = 1; // 2% occurrence
+
+    // Naive model
+    const naive = outcomes.map(() => 0.02);
+    // Slightly skilled model
+    const skilled = outcomes.map((_, i) => (i === 0 || i === 50) ? 0.10 : 0.01);
+
+    const naiveBSS = brierSkillScore(naive, outcomes);
+    const skilledBSS = brierSkillScore(skilled, outcomes);
+
+    expect(naiveBSS).toBeCloseTo(0, 1); // Naive = reference
+    expect(skilledBSS).toBeGreaterThan(0); // Skilled beats reference
+  });
+
+  it("respects custom base rate", () => {
+    const outcomes = [1, 0, 1, 0];
+    const predictions = [0.7, 0.3, 0.7, 0.3];
+    const withDefault = brierSkillScore(predictions, outcomes);
+    const withCustom = brierSkillScore(predictions, outcomes, 0.7);
+
+    // Different base rates should give different BSS
+    expect(withDefault).not.toBeCloseTo(withCustom, 2);
+  });
+
+  it("returns 0 for empty arrays", () => {
+    expect(brierSkillScore([], [])).toBe(0);
   });
 });

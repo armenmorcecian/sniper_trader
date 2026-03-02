@@ -6,6 +6,7 @@ import {
   kendallTau,
   buildCorrelationMatrix,
   assessPortfolioRisk,
+  calibrateCopulaDf,
 } from "../copula";
 
 describe("gaussianCopula", () => {
@@ -165,5 +166,76 @@ describe("assessPortfolioRisk", () => {
 
     // Correlated portfolio should have higher worst-case joint loss
     expect(correlated.worstCaseJoint).toBeGreaterThanOrEqual(independent.worstCaseJoint * 0.8);
+  });
+
+  it("accepts custom degreesOfFreedom for t-copula", () => {
+    const positions = [
+      { prob: 0.6, size: 10, expectedPnl: 5 },
+      { prob: 0.55, size: 10, expectedPnl: 4 },
+    ];
+    const corr = [[1, 0.6], [0.6, 1]];
+
+    // Lower df = fatter tails = more extreme co-movements
+    const lowDf = assessPortfolioRisk(positions, corr, "t", 3);
+    const highDf = assessPortfolioRisk(positions, corr, "t", 20);
+
+    // Both should return valid results
+    expect(lowDf.expectedPnl).toBeDefined();
+    expect(highDf.expectedPnl).toBeDefined();
+    expect(lowDf.pnlVariance).toBeGreaterThanOrEqual(0);
+    expect(highDf.pnlVariance).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe("calibrateCopulaDf", () => {
+  it("returns valid df in expected range", () => {
+    // Generate correlated price series
+    const n = 50;
+    const series1: number[] = [];
+    const series2: number[] = [];
+    let p1 = 0.5, p2 = 0.5;
+
+    for (let i = 0; i < n; i++) {
+      const shock = (Math.sin(i * 0.3) + Math.cos(i * 0.7)) * 0.02;
+      p1 = Math.max(0.1, Math.min(0.9, p1 + shock + (Math.random() - 0.5) * 0.03));
+      p2 = Math.max(0.1, Math.min(0.9, p2 + shock * 0.8 + (Math.random() - 0.5) * 0.03));
+      series1.push(p1);
+      series2.push(p2);
+    }
+
+    const df = calibrateCopulaDf([series1, series2]);
+    expect(df).toBeGreaterThanOrEqual(2);
+    expect(df).toBeLessThanOrEqual(30);
+  });
+
+  it("returns default df=4 for insufficient data", () => {
+    const short1 = [0.5, 0.6, 0.55];
+    const short2 = [0.4, 0.45, 0.42];
+
+    const df = calibrateCopulaDf([short1, short2]);
+    expect(df).toBe(4);
+  });
+
+  it("returns default df=4 for single market", () => {
+    const df = calibrateCopulaDf([[0.5, 0.6, 0.55, 0.58]]);
+    expect(df).toBe(4);
+  });
+
+  it("handles 3+ markets", () => {
+    const n = 50;
+    const series: number[][] = [[], [], []];
+    const bases = [0.5, 0.6, 0.4];
+
+    for (let i = 0; i < n; i++) {
+      const common = Math.sin(i * 0.2) * 0.02;
+      for (let m = 0; m < 3; m++) {
+        bases[m] = Math.max(0.1, Math.min(0.9, bases[m] + common + (Math.random() - 0.5) * 0.02));
+        series[m].push(bases[m]);
+      }
+    }
+
+    const df = calibrateCopulaDf(series);
+    expect(df).toBeGreaterThanOrEqual(2);
+    expect(df).toBeLessThanOrEqual(30);
   });
 });

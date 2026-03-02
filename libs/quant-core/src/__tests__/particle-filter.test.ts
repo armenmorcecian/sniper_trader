@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { PredictionMarketParticleFilter } from "../particle-filter";
+import { generateSyntheticPrices } from "./test-helpers";
 
 describe("PredictionMarketParticleFilter", () => {
   it("converges to true probability from prior", () => {
@@ -154,5 +155,162 @@ describe("PredictionMarketParticleFilter", () => {
 
     expect(pf.observationCount).toBe(3);
     expect(pf.history).toHaveLength(3);
+  });
+});
+
+describe("PredictionMarketParticleFilter — near-expiry vol scaling", () => {
+  it("produces lower variance with expiryTime set near expiry", () => {
+    // Filter with expiry 1 hour away
+    const now = new Date();
+    const expiryTime = new Date(now.getTime() + 1 * 60 * 60 * 1000).toISOString(); // 1 hour
+
+    const pfExpiry = new PredictionMarketParticleFilter({
+      nParticles: 1000,
+      priorProb: 0.50,
+      processVol: 0.05,
+      obsNoise: 0.02,
+      expiryTime,
+    });
+
+    const pfNoExpiry = new PredictionMarketParticleFilter({
+      nParticles: 1000,
+      priorProb: 0.50,
+      processVol: 0.05,
+      obsNoise: 0.02,
+    });
+
+    // Feed same observations
+    const observations = [0.60, 0.62, 0.61, 0.63, 0.60, 0.62];
+    const currentTime = now.toISOString();
+
+    const expiryResults: number[] = [];
+    const noExpiryResults: number[] = [];
+
+    for (const obs of observations) {
+      const e1 = pfExpiry.update(obs, currentTime);
+      const e2 = pfNoExpiry.update(obs);
+      expiryResults.push(e1.filteredProb);
+      noExpiryResults.push(e2.filteredProb);
+    }
+
+    // With reduced vol, the near-expiry filter should produce tighter CI
+    const expiryEst = pfExpiry.estimate();
+    const noExpiryEst = pfNoExpiry.estimate();
+    const expiryWidth = expiryEst.ci95[1] - expiryEst.ci95[0];
+    const noExpiryWidth = noExpiryEst.ci95[1] - noExpiryEst.ci95[0];
+
+    expect(expiryWidth).toBeLessThanOrEqual(noExpiryWidth * 1.1);
+  });
+
+  it("uses full vol when far from expiry (>24h)", () => {
+    const now = new Date();
+    const expiryTime = new Date(now.getTime() + 48 * 60 * 60 * 1000).toISOString(); // 48h
+
+    const pfExpiry = new PredictionMarketParticleFilter({
+      nParticles: 1000,
+      priorProb: 0.50,
+      processVol: 0.03,
+      obsNoise: 0.02,
+      expiryTime,
+    });
+
+    const pfNoExpiry = new PredictionMarketParticleFilter({
+      nParticles: 1000,
+      priorProb: 0.50,
+      processVol: 0.03,
+      obsNoise: 0.02,
+    });
+
+    // Feed same observations — results should be similar since we're far from expiry
+    for (const obs of [0.60, 0.62, 0.61, 0.63, 0.60]) {
+      pfExpiry.update(obs, now.toISOString());
+      pfNoExpiry.update(obs);
+    }
+
+    const e1 = pfExpiry.estimate();
+    const e2 = pfNoExpiry.estimate();
+
+    // Should be very close since vol scaling only kicks in < 24h
+    expect(Math.abs(e1.filteredProb - e2.filteredProb)).toBeLessThan(0.05);
+  });
+
+  it("uses full vol when no expiryTime configured", () => {
+    const pf = new PredictionMarketParticleFilter({
+      nParticles: 1000,
+      priorProb: 0.50,
+      processVol: 0.03,
+      obsNoise: 0.02,
+    });
+
+    // Passing currentTime without expiryTime should have no effect
+    const est = pf.update(0.60, new Date().toISOString());
+    expect(est.filteredProb).toBeGreaterThan(0);
+    expect(est.filteredProb).toBeLessThan(1);
+  });
+
+  it("serialize/deserialize preserves behavior with expiryTime", () => {
+    const now = new Date();
+    const expiryTime = new Date(now.getTime() + 2 * 60 * 60 * 1000).toISOString();
+
+    const pf = new PredictionMarketParticleFilter({
+      nParticles: 500,
+      priorProb: 0.50,
+      expiryTime,
+    });
+
+    pf.update(0.55, now.toISOString());
+    pf.update(0.60, now.toISOString());
+
+    const state = pf.serialize();
+    const restored = PredictionMarketParticleFilter.deserialize(state, { expiryTime });
+
+    const originalEst = pf.estimate();
+    const restoredEst = restored.estimate();
+
+    expect(restoredEst.filteredProb).toBe(originalEst.filteredProb);
+    expect(restored.observationCount).toBe(2);
+  });
+});
+
+describe("PredictionMarketParticleFilter.calibrate", () => {
+  it("returns valid hyperparameters", () => {
+    const prices = generateSyntheticPrices({
+      nSteps: 30,
+      startProb: 0.60,
+      processVol: 0.03,
+      obsNoise: 0.02,
+      seed: 42,
+    });
+
+    const result = PredictionMarketParticleFilter.calibrate(prices, 0.50, 200);
+
+    expect(result.processVol).toBeGreaterThan(0);
+    expect(result.processVol).toBeLessThan(0.2);
+    expect(result.obsNoise).toBeGreaterThan(0);
+    expect(result.obsNoise).toBeLessThan(0.1);
+    expect(isFinite(result.logLikelihood)).toBe(true);
+  });
+
+  it("selects higher processVol for more volatile data", () => {
+    const calm = generateSyntheticPrices({
+      nSteps: 40,
+      startProb: 0.50,
+      processVol: 0.01,
+      obsNoise: 0.01,
+      seed: 100,
+    });
+
+    const volatile = generateSyntheticPrices({
+      nSteps: 40,
+      startProb: 0.50,
+      processVol: 0.10,
+      obsNoise: 0.03,
+      seed: 100,
+    });
+
+    const calmResult = PredictionMarketParticleFilter.calibrate(calm, 0.50, 200);
+    const volatileResult = PredictionMarketParticleFilter.calibrate(volatile, 0.50, 200);
+
+    expect(volatileResult.processVol).toBeGreaterThanOrEqual(calmResult.processVol);
   });
 });

@@ -128,16 +128,28 @@ export async function collectPrices(
       let filteredProbability: number | undefined;
       let divergence: number | undefined;
       try {
-        const pf = filterStates[conditionId]
-          ? PredictionMarketParticleFilter.deserialize(filterStates[conditionId])
-          : new PredictionMarketParticleFilter({
-              nParticles: 1000,
-              priorProb: 0.50,
-              processVol: 0.03,
-              obsNoise: 0.02,
-            });
+        let pf: InstanceType<typeof PredictionMarketParticleFilter>;
+        if (filterStates[conditionId]) {
+          pf = PredictionMarketParticleFilter.deserialize(filterStates[conditionId]);
+        } else {
+          // Calibrate hyperparameters from existing history if enough data
+          const existingHistory = history[conditionId] || [];
+          const existingPrices = existingHistory.map(s => s.yesPrice);
+          let pfConfig: { nParticles: number; priorProb: number; processVol: number; obsNoise: number } = {
+            nParticles: 1000,
+            priorProb: 0.50,
+            processVol: 0.03,
+            obsNoise: 0.02,
+          };
+          if (existingPrices.length >= 20) {
+            const calibrated = PredictionMarketParticleFilter.calibrate(existingPrices, 0.50, 500);
+            pfConfig.processVol = calibrated.processVol;
+            pfConfig.obsNoise = calibrated.obsNoise;
+          }
+          pf = new PredictionMarketParticleFilter(pfConfig);
+        }
 
-        const estimate = pf.update(yesPrice);
+        const estimate = pf.update(yesPrice, new Date().toISOString());
         filteredProbability = Math.round(estimate.filteredProb * 10000) / 10000;
         divergence = Math.round(estimate.divergence * 10000) / 10000;
         filterStates[conditionId] = pf.serialize();

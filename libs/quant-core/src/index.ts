@@ -100,12 +100,18 @@ export {
   stratifiedSamples,
   importanceSamplingEstimate,
   brierScore,
+  brierSkillScore,
   simulateBinaryContract,
+  simulatePredictionContract,
+  logit,
+  sigmoid,
 } from "./monte-carlo";
 export type {
   MonteCarloConfig,
   MonteCarloResult,
   ImportanceSamplingConfig,
+  PredictionContractParams,
+  PredictionContractResult,
 } from "./monte-carlo";
 
 // ─── Particle Filter ───────────────────────────────────────────────────────
@@ -124,6 +130,7 @@ export {
   kendallTau,
   buildCorrelationMatrix,
   assessPortfolioRisk,
+  calibrateCopulaDf,
 } from "./copula";
 export type { CopulaResult, PortfolioRisk } from "./copula";
 

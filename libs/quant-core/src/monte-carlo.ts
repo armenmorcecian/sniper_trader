@@ -7,7 +7,8 @@
 //
 // Also includes:
 //   - Brier score for calibration measurement
-//   - Binary contract probability estimation via GBM
+//   - Binary contract probability estimation via GBM (equities)
+//   - Prediction market contract simulation via logit-diffusion (bounded [0,1])
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -44,6 +45,34 @@ export interface ImportanceSamplingConfig {
   tiltMean: number;
   /** Shifted distribution std */
   tiltStd: number;
+}
+
+export interface PredictionContractParams {
+  /** Current market probability (0,1) */
+  currentProb: number;
+  /** Volatility in logit space */
+  volatility: number;
+  /** Time to expiry in years */
+  timeToExpiry: number;
+  /** Number of simulation paths (default: 10000) */
+  nPaths?: number;
+  /** Optional seed for reproducibility */
+  seed?: number;
+  /** Use Brownian bridge conditioning for near-expiry convergence */
+  useBrownianBridge?: boolean;
+  /** Terminal probability to condition on (0 or 1) when using Brownian bridge */
+  terminalProb?: number;
+}
+
+export interface PredictionContractResult {
+  /** Implied probability of Yes outcome */
+  impliedProbYes: number;
+  /** Terminal quantiles [5th, 25th, 50th, 75th, 95th] */
+  terminalQuantiles: [number, number, number, number, number];
+  /** Standard error of the probability estimate */
+  stdError: number;
+  /** Number of simulation paths */
+  nPaths: number;
 }
 
 // ─── PRNG (Mulberry32 — deterministic, fast) ────────────────────────────────
@@ -132,6 +161,23 @@ function normalCdf(x: number): number {
   const y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-absX * absX / 2);
 
   return 0.5 * (1.0 + sign * y);
+}
+
+// ─── Logit/Sigmoid Utilities ────────────────────────────────────────────────
+
+/** Logit transform: maps (0,1) → (-∞, +∞). Clamps to avoid ±Infinity. */
+export function logit(p: number): number {
+  const clamped = Math.max(1e-10, Math.min(1 - 1e-10, p));
+  return Math.log(clamped / (1 - clamped));
+}
+
+/** Sigmoid (inverse logit): maps (-∞, +∞) → (0,1). Numerically stable. */
+export function sigmoid(x: number): number {
+  if (x >= 0) {
+    return 1 / (1 + Math.exp(-x));
+  }
+  const ex = Math.exp(x);
+  return ex / (1 + ex);
 }
 
 // ─── Sample Generation ──────────────────────────────────────────────────────
@@ -306,7 +352,9 @@ export function importanceSamplingEstimate(
  *   BS = (1/N) × Σ (p_i − o_i)²
  *
  * Lower is better: 0 = perfect, 0.25 = always predict 0.5
- * Below 0.10 is excellent calibration.
+ * Below 0.10 is good for balanced outcomes; for rare events (base rate < 5%),
+ * always predicting the base rate scores BS < 0.05. Use brierSkillScore() to
+ * account for base-rate difficulty.
  */
 export function brierScore(predictions: number[], outcomes: number[]): number {
   const n = Math.min(predictions.length, outcomes.length);
@@ -317,6 +365,47 @@ export function brierScore(predictions: number[], outcomes: number[]): number {
     sum += (predictions[i] - outcomes[i]) ** 2;
   }
   return Math.round((sum / n) * 10000) / 10000;
+}
+
+/**
+ * Brier Skill Score: measures improvement over a reference (naive) forecast.
+ *   BSS = 1 - BS_model / BS_reference
+ *
+ * BSS = 1: perfect forecast
+ * BSS = 0: no better than reference (naive base-rate model)
+ * BSS < 0: worse than reference (anti-skilled)
+ *
+ * The reference forecast always predicts the base rate. If baseRate is not
+ * provided, it defaults to the sample mean of outcomes.
+ */
+export function brierSkillScore(
+  predictions: number[],
+  outcomes: number[],
+  baseRate?: number,
+): number {
+  const n = Math.min(predictions.length, outcomes.length);
+  if (n === 0) return 0;
+
+  // Model Brier score
+  let bsModel = 0;
+  let sumOutcomes = 0;
+  for (let i = 0; i < n; i++) {
+    bsModel += (predictions[i] - outcomes[i]) ** 2;
+    sumOutcomes += outcomes[i];
+  }
+  bsModel /= n;
+
+  // Reference Brier score (always predict base rate)
+  const ref = baseRate ?? sumOutcomes / n;
+  let bsRef = 0;
+  for (let i = 0; i < n; i++) {
+    bsRef += (ref - outcomes[i]) ** 2;
+  }
+  bsRef /= n;
+
+  if (bsRef === 0) return bsModel === 0 ? 0 : -Infinity;
+
+  return Math.round((1 - bsModel / bsRef) * 10000) / 10000;
 }
 
 // ─── Binary Contract Simulation (GBM) ───────────────────────────────────────
@@ -369,5 +458,86 @@ export function simulateBinaryContract(params: {
   return {
     ...result,
     closedFormPrice: Math.round(closedFormPrice * 1e6) / 1e6,
+  };
+}
+
+// ─── Prediction Market Simulation (Logit-Diffusion) ──────────────────────────
+
+/**
+ * Simulate a prediction market contract using logit-space diffusion.
+ * Unlike GBM (which is for equities), logit-diffusion guarantees all terminal
+ * probabilities remain in (0,1).
+ *
+ * Model: logit(p_T) = logit(p_0) + sigma * sqrt(T) * Z
+ *
+ * With Brownian bridge conditioning, paths converge toward the terminal
+ * probability near expiry — useful for contracts approaching resolution.
+ */
+export function simulatePredictionContract(
+  params: PredictionContractParams,
+): PredictionContractResult {
+  const {
+    currentProb,
+    volatility: sigma,
+    timeToExpiry: T,
+    nPaths = 10000,
+    seed,
+    useBrownianBridge = false,
+    terminalProb,
+  } = params;
+
+  const logitP0 = logit(currentProb);
+  const samples = stratifiedSamples(nPaths, 10, seed);
+  const terminalProbs = new Float64Array(nPaths);
+
+  for (let i = 0; i < nPaths; i++) {
+    const z = samples[i];
+    let logitTerminal: number;
+
+    if (useBrownianBridge && terminalProb != null && T > 0) {
+      // Brownian bridge: condition paths to converge toward terminal value
+      const logitTarget = logit(Math.max(0.001, Math.min(0.999, terminalProb)));
+      // Bridge variance narrows near expiry
+      const bridgeStd = sigma * Math.sqrt(T) * 0.1;
+      logitTerminal = logitTarget + bridgeStd * z;
+    } else {
+      // Standard logit-space diffusion
+      logitTerminal = logitP0 + sigma * Math.sqrt(Math.max(0, T)) * z;
+    }
+
+    terminalProbs[i] = sigmoid(logitTerminal);
+  }
+
+  // Compute mean and standard error
+  let sum = 0;
+  let sumSq = 0;
+  for (let i = 0; i < nPaths; i++) {
+    sum += terminalProbs[i];
+    sumSq += terminalProbs[i] * terminalProbs[i];
+  }
+  const mean = sum / nPaths;
+  const variance = sumSq / nPaths - mean * mean;
+  const stdError = Math.sqrt(Math.max(0, variance) / nPaths);
+
+  // Sort for quantile computation
+  const sorted = Array.from(terminalProbs).sort((a, b) => a - b);
+  const quantile = (q: number): number => {
+    const idx = Math.min(Math.floor(sorted.length * q), sorted.length - 1);
+    return sorted[idx];
+  };
+
+  const r6 = (x: number): number => Math.round(x * 1e6) / 1e6;
+
+  return {
+    impliedProbYes: r6(mean),
+    terminalQuantiles: [
+      r6(quantile(0.05)),
+      r6(quantile(0.25)),
+      r6(quantile(0.50)),
+      r6(quantile(0.75)),
+      r6(quantile(0.95)),
+    ],
+    stdError: Math.round(stdError * 1e8) / 1e8,
+    nPaths,
   };
 }

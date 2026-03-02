@@ -712,6 +712,7 @@ export interface CalibrationEntry {
 
 export interface CalibrationMetrics {
   brierScore: number;
+  brierSkillScore: number;
   nPredictions: number;
   nResolved: number;
   calibrationByBucket: Array<{
@@ -796,6 +797,7 @@ export function getCalibrationMetrics(
     if (allRows.length === 0) {
       return {
         brierScore: 0,
+        brierSkillScore: 0,
         nPredictions: totalPredictions.cnt,
         nResolved: 0,
         calibrationByBucket: [],
@@ -807,7 +809,17 @@ export function getCalibrationMetrics(
     for (const row of allRows) {
       bsSum += (row.predicted_prob - row.actual_outcome) ** 2;
     }
-    const brierScore = Math.round((bsSum / allRows.length) * 10000) / 10000;
+    const rawBS = bsSum / allRows.length;
+    const brierScore = Math.round(rawBS * 10000) / 10000;
+
+    // Brier Skill Score: 1 - BS_model / BS_reference (reference = always predict base rate)
+    const meanOutcome = allRows.reduce((s, r) => s + r.actual_outcome, 0) / allRows.length;
+    let bsRef = 0;
+    for (const row of allRows) {
+      bsRef += (meanOutcome - row.actual_outcome) ** 2;
+    }
+    bsRef /= allRows.length;
+    const brierSkillScore = bsRef > 0 ? Math.round((1 - rawBS / bsRef) * 10000) / 10000 : 0;
 
     // Calibration by bucket: group predictions into 10 bins [0-0.1, 0.1-0.2, ...]
     const buckets: Map<string, { sumPred: number; sumActual: number; count: number }> = new Map();
@@ -830,6 +842,7 @@ export function getCalibrationMetrics(
 
     return {
       brierScore,
+      brierSkillScore,
       nPredictions: totalPredictions.cnt,
       nResolved: allRows.length,
       calibrationByBucket,
