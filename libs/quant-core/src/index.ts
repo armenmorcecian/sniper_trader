@@ -92,3 +92,41 @@ export {
   resolveAlert, resolveAlertsByType, cleanExpiredAlerts,
 } from "./risk-alerts";
 export type { RiskAlert, TradingBlockStatus, ActiveAlertOptions } from "./risk-alerts";
+
+// ─── Monte Carlo Simulation ────────────────────────────────────────────────
+export {
+  monteCarloEstimate,
+  antitheticSamples,
+  stratifiedSamples,
+  importanceSamplingEstimate,
+  brierScore,
+  simulateBinaryContract,
+} from "./monte-carlo";
+export type {
+  MonteCarloConfig,
+  MonteCarloResult,
+  ImportanceSamplingConfig,
+} from "./monte-carlo";
+
+// ─── Particle Filter ───────────────────────────────────────────────────────
+export { PredictionMarketParticleFilter } from "./particle-filter";
+export type {
+  ParticleFilterConfig,
+  ParticleFilterState,
+  FilterEstimate,
+} from "./particle-filter";
+
+// ─── Copula Models ─────────────────────────────────────────────────────────
+export {
+  gaussianCopula,
+  tCopula,
+  claytonCopula,
+  kendallTau,
+  buildCorrelationMatrix,
+  assessPortfolioRisk,
+} from "./copula";
+export type { CopulaResult, PortfolioRisk } from "./copula";
+
+// ─── Calibration Tracking ──────────────────────────────────────────────────
+export { logPrediction, resolvePrediction, getCalibrationMetrics } from "./journal";
+export type { CalibrationEntry, CalibrationMetrics } from "./journal";

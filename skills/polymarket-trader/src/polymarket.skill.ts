@@ -2,11 +2,19 @@ import "dotenv/config";
 import { Type, type Static } from "@sinclair/typebox";
 import { PolymarketService } from "./polymarket.service";
 import { analyzeOrderBookDepth, shouldAvoidMarket, checkStopLoss } from "./analysis";
+import { executePairArbitrage } from "./arbitrage";
 import { calculateBetSize } from "./utils";
 import { collectPrices, getStoredHistory } from "./price-collector";
 import { calculateIndicators } from "./indicators";
+import { simulateArbitrage } from "./arb-simulator";
+import { backtestArbitrage } from "./arb-backtest";
 import type { PolymarketConfig, TradeParams } from "./types";
-import { checkCircuitBreaker, checkConcentration, isApiAvailable, recordTrade, queryTrades, getDailySummary, getTradesToday, recordEquitySnapshot } from "quant-core";
+import {
+  checkCircuitBreaker, checkConcentration, isApiAvailable,
+  recordTrade, queryTrades, getDailySummary, getTradesToday, recordEquitySnapshot,
+  PredictionMarketParticleFilter, getCalibrationMetrics,
+  buildCorrelationMatrix, assessPortfolioRisk,
+} from "quant-core";
 import { getPerformanceMetrics } from "quant-core/src/performance";
 import type { TradeEntry } from "quant-core";
 
@@ -124,6 +132,44 @@ const PerformanceReportSchema = Type.Object({
   ], { description: "Filter by skill. Defaults to polymarket." })),
 });
 
+const ExecutePairArbitrageSchema = Type.Object({
+  marketConditionId: Type.String({ description: "Polymarket condition ID (must be a binary Yes/No market)" }),
+  firstLeg: Type.Union([Type.Literal("Yes"), Type.Literal("No")], { description: "Which outcome to buy first" }),
+  amount: Type.Number({ description: "USDC amount to spend on each leg" }),
+  firstLegPrice: Type.Number({ description: "Limit price for the first leg order (e.g., 0.45)" }),
+  margin: Type.Number({ description: "Target profit margin in price units (e.g., 0.02 = 2 cents guaranteed profit per unit)" }),
+  legTimeoutMs: Type.Optional(Type.Number({ default: 3000, description: "Milliseconds to wait for second leg before bailout (default: 3000)" })),
+  pollIntervalMs: Type.Optional(Type.Number({ default: 500, description: "Milliseconds between order book polls during hedge window (default: 500)" })),
+});
+
+const SimulateArbitrageSchema = Type.Object({
+  marketConditionId: Type.String({ description: "Polymarket condition ID (binary Yes/No market)" }),
+  firstLeg: Type.Union([Type.Literal("Yes"), Type.Literal("No")], { description: "Which outcome to buy first" }),
+  amount: Type.Number({ description: "USDC amount per leg" }),
+  firstLegPrice: Type.Number({ description: "Limit price for leg 1" }),
+  margin: Type.Number({ description: "Target profit margin" }),
+  legTimeoutMs: Type.Optional(Type.Number({ default: 3000, description: "Hedge window timeout ms" })),
+  nPaths: Type.Optional(Type.Number({ default: 5000, description: "Monte Carlo simulation paths" })),
+});
+
+const EdgeDetectionSchema = Type.Object({
+  conditionId: Type.String({ description: "Polymarket condition ID" }),
+  outcome: Type.Union([Type.Literal("Yes"), Type.Literal("No")], { description: "Which outcome to analyze" }),
+});
+
+const BacktestArbitrageSchema = Type.Object({
+  trueProb: Type.Number({ description: "Assumed true probability for ABM simulation (0-1)" }),
+  amount: Type.Number({ description: "USDC per leg" }),
+  margin: Type.Number({ description: "Target margin" }),
+  legTimeoutMs: Type.Optional(Type.Number({ default: 3000, description: "Hedge window timeout ms" })),
+  pollIntervalMs: Type.Optional(Type.Number({ default: 500, description: "Poll interval ms" })),
+  nTrials: Type.Optional(Type.Number({ default: 100, description: "Number of arbitrage trials to simulate" })),
+});
+
+const PortfolioCorrelationSchema = Type.Object({
+  conditionIds: Type.Array(Type.String(), { description: "List of condition IDs to analyze for correlation" }),
+});
+
 // ─── Tool Types ─────────────────────────────────────────────────────────────
 
 type ScanMarketsParams = Static<typeof ScanMarketsSchema>;
@@ -135,6 +181,11 @@ type AnalyzeIndicatorsParams = Static<typeof AnalyzeIndicatorsSchema>;
 type CancelOrderParams = Static<typeof CancelOrderSchema>;
 type TradeJournalParams = Static<typeof TradeJournalSchema>;
 type PerformanceReportParams = Static<typeof PerformanceReportSchema>;
+type ExecutePairArbitrageParams = Static<typeof ExecutePairArbitrageSchema>;
+type SimulateArbitrageParams = Static<typeof SimulateArbitrageSchema>;
+type EdgeDetectionParams = Static<typeof EdgeDetectionSchema>;
+type BacktestArbitrageParams = Static<typeof BacktestArbitrageSchema>;
+type PortfolioCorrelationParams = Static<typeof PortfolioCorrelationSchema>;
 
 // ─── Parameter Normalization ────────────────────────────────────────────────
 // Agents frequently pass alternate param names. Map them to canonical names.
@@ -560,16 +611,381 @@ export const tools = [
   {
     name: "performance_report",
     description:
-      "Performance analytics: Sharpe ratio, max drawdown, win rate, profit factor. Computed from trade journal + equity snapshots.",
+      "Performance analytics: Sharpe ratio, max drawdown, win rate, profit factor, and prediction calibration (Brier score). Computed from trade journal + equity snapshots + calibration log.",
     parameters: PerformanceReportSchema,
     handler: async (params: PerformanceReportParams) => {
       try {
-        return getPerformanceMetrics({
+        const metrics = getPerformanceMetrics({
           skill: params.skill || "polymarket",
           period: params.period || "weekly",
         });
+
+        // Append calibration metrics if available
+        let calibration;
+        try {
+          calibration = getCalibrationMetrics();
+        } catch { /* calibration table may not exist yet */ }
+
+        return { ...metrics, calibration };
       } catch (err) {
         return { error: `performance_report: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    },
+  },
+
+  {
+    name: "execute_pair_arbitrage",
+    description:
+      "Execute a two-legged pair arbitrage on a binary market. " +
+      "Buys one outcome at a limit price, then dynamically hedges by buying the opposite outcome " +
+      "if the best ask falls within the profit window (1.00 - P_filled - margin). " +
+      "If the hedge timeout expires without completing the pair, automatically bails out by " +
+      "selling the filled leg to flatten directional risk. " +
+      "Pre-checks: daily loss circuit breaker, API health, concentration limits. " +
+      "All legs and bailout actions are recorded to the trade journal.",
+    parameters: ExecutePairArbitrageSchema,
+    handler: async (rawParams: ExecutePairArbitrageParams) => {
+      const params = normalizeParams(rawParams as Record<string, unknown>) as ExecutePairArbitrageParams;
+      if (!params.marketConditionId) {
+        return { error: "marketConditionId is required.", code: "MISSING_PARAM" };
+      }
+      try {
+        const service = getPolymarketService();
+
+        // ── Daily loss circuit breaker ──────────────────────────────────────
+        const portfolio = await service.getPortfolioValue();
+        const dailyPnl = portfolio.positions.reduce((sum, p) => sum + p.pnl, 0);
+        const maxDailyLoss = Number(process.env.POLY_MAX_DAILY_LOSS_PCT) || 10;
+        const cbResult = checkCircuitBreaker(dailyPnl, portfolio.totalEquity, maxDailyLoss);
+        if (cbResult.tripped) {
+          await service.cancelAllOrders();
+          recordTrade({
+            skill: "polymarket",
+            tool: "execute_pair_arbitrage",
+            conditionId: params.marketConditionId,
+            side: "BUY",
+            amount: params.amount,
+            price: params.firstLegPrice,
+            status: "blocked",
+            errorCode: "DAILY_LOSS_LIMIT",
+            equityAtTrade: portfolio.totalEquity,
+            metadata: { dailyPnlPercent: cbResult.dailyPnlPercent, cancelledOrders: true },
+          });
+          return {
+            error: "CIRCUIT_BREAKER",
+            message: cbResult.reason,
+            details: cbResult,
+            ordersCancelled: true,
+          };
+        }
+
+        // ── API availability check ─────────────────────────────────────────
+        if (!isApiAvailable("poly-gamma") || !isApiAvailable("poly-data")) {
+          recordTrade({
+            skill: "polymarket",
+            tool: "execute_pair_arbitrage",
+            conditionId: params.marketConditionId,
+            side: "BUY",
+            amount: params.amount,
+            status: "blocked",
+            errorCode: "API_UNAVAILABLE",
+          });
+          return { error: "API_UNAVAILABLE", message: "Polymarket APIs have too many consecutive failures. Operating in read-only mode." };
+        }
+
+        // ── Balance check ──────────────────────────────────────────────────
+        // Need enough for both legs in the worst case
+        const totalNeeded = params.amount * 2;
+        if (totalNeeded > portfolio.usdcBalance) {
+          return {
+            error: "INSUFFICIENT_FUNDS",
+            message: `Need $${totalNeeded.toFixed(2)} for both legs, have $${portfolio.usdcBalance.toFixed(2)}.`,
+          };
+        }
+
+        // ── Pre-trade MC simulation gate ────────────────────────────────────
+        const secondLeg = params.firstLeg === "Yes" ? "No" : "Yes";
+        let simulationResult: { expectedPnl: number; profitProbability: number; recommendation: string } | undefined;
+        try {
+          const [leg1Book, leg2Book] = await Promise.all([
+            service.getOrderBookForToken(params.marketConditionId, params.firstLeg),
+            service.getOrderBookForToken(params.marketConditionId, secondLeg),
+          ]);
+          const leg2BestAsk = leg2Book.orderBook.asks.length > 0
+            ? parseFloat(leg2Book.orderBook.asks[0].price) : 1.0;
+
+          const simResult = simulateArbitrage({
+            leg1Price: params.firstLegPrice,
+            leg2BestAsk,
+            leg2AskDepth: leg2Book.orderBook.asks,
+            bidDepth: leg1Book.orderBook.bids,
+            amount: params.amount,
+            margin: params.margin,
+            legTimeoutMs: params.legTimeoutMs || 3000,
+            pollIntervalMs: params.pollIntervalMs || 500,
+            nPaths: 3000,
+          });
+
+          simulationResult = {
+            expectedPnl: simResult.expectedPnl,
+            profitProbability: simResult.profitProbability,
+            recommendation: simResult.recommendation,
+          };
+
+          if (simResult.recommendation === "SKIP") {
+            recordTrade({
+              skill: "polymarket",
+              tool: "execute_pair_arbitrage",
+              conditionId: params.marketConditionId,
+              side: "BUY",
+              amount: params.amount,
+              price: params.firstLegPrice,
+              status: "blocked",
+              errorCode: "MC_SIMULATION_SKIP",
+              metadata: { simulation: simulationResult, reason: simResult.reason },
+            });
+            return {
+              error: "MC_SIMULATION_SKIP",
+              message: `Pre-trade simulation recommends SKIP: ${simResult.reason}`,
+              simulation: simResult,
+            };
+          }
+        } catch {
+          // Non-fatal — proceed without simulation if it fails
+        }
+
+        // ── Execute arbitrage engine ───────────────────────────────────────
+        const arbResult = await executePairArbitrage(service, {
+          marketConditionId: params.marketConditionId,
+          firstLeg: params.firstLeg,
+          amount: params.amount,
+          firstLegPrice: params.firstLegPrice,
+          margin: params.margin,
+          legTimeoutMs: params.legTimeoutMs,
+          pollIntervalMs: params.pollIntervalMs,
+        });
+
+        // Attach simulation result if available
+        if (simulationResult) {
+          arbResult.simulationResult = simulationResult;
+        }
+
+        return arbResult;
+      } catch (err) {
+        recordTrade({
+          skill: "polymarket",
+          tool: "execute_pair_arbitrage",
+          conditionId: params.marketConditionId,
+          side: "BUY",
+          amount: params.amount,
+          price: params.firstLegPrice,
+          status: "error",
+          metadata: { error: err instanceof Error ? err.message : String(err) },
+        });
+        return formatAxiosError(err, `execute_pair_arbitrage(${params.marketConditionId})`);
+      }
+    },
+  },
+
+  {
+    name: "simulate_arbitrage",
+    description:
+      "Dry-run Monte Carlo simulation of a pair arbitrage BEFORE execution. " +
+      "Runs N simulated paths incorporating fees, slippage, and timeout probability. " +
+      "Returns expected P&L, profit probability, bailout probability, and a recommendation " +
+      "(EXECUTE/SKIP/REDUCE_SIZE). Call this before execute_pair_arbitrage to validate the trade.",
+    parameters: SimulateArbitrageSchema,
+    handler: async (rawParams: SimulateArbitrageParams) => {
+      const params = normalizeParams(rawParams as Record<string, unknown>) as SimulateArbitrageParams;
+      if (!params.marketConditionId) {
+        return { error: "marketConditionId is required.", code: "MISSING_PARAM" };
+      }
+      try {
+        const service = getPolymarketService();
+        const secondLeg = params.firstLeg === "Yes" ? "No" : "Yes";
+
+        // Fetch order books for both outcomes
+        const [leg1Book, leg2Book] = await Promise.all([
+          service.getOrderBookForToken(params.marketConditionId, params.firstLeg),
+          service.getOrderBookForToken(params.marketConditionId, secondLeg),
+        ]);
+
+        const bestAsk = leg2Book.orderBook.asks.length > 0
+          ? parseFloat(leg2Book.orderBook.asks[0].price)
+          : 1.0;
+
+        const result = simulateArbitrage({
+          leg1Price: params.firstLegPrice,
+          leg2BestAsk: bestAsk,
+          leg2AskDepth: leg2Book.orderBook.asks,
+          bidDepth: leg1Book.orderBook.bids,
+          amount: params.amount,
+          margin: params.margin,
+          legTimeoutMs: params.legTimeoutMs || 3000,
+          pollIntervalMs: 500,
+          nPaths: params.nPaths || 5000,
+        });
+
+        return result;
+      } catch (err) {
+        return formatAxiosError(err, `simulate_arbitrage(${params.marketConditionId})`);
+      }
+    },
+  },
+
+  {
+    name: "edge_detection",
+    description:
+      "Particle filter edge detection for a market. Compares the filtered 'true' probability " +
+      "(smoothed via Sequential Monte Carlo) against the raw market price. High divergence " +
+      "suggests a trading opportunity — the market is mispricing the event. " +
+      "Requires 5+ price snapshots from collect_prices to be useful.",
+    parameters: EdgeDetectionSchema,
+    handler: async (params: EdgeDetectionParams) => {
+      try {
+        const snapshots = getStoredHistory(params.conditionId);
+        if (snapshots.length < 5) {
+          return {
+            error: "NOT_ENOUGH_DATA",
+            snapshotsAvailable: snapshots.length,
+            required: 5,
+            message: `Need at least 5 price snapshots for edge detection, have ${snapshots.length}. Keep calling collect_prices.`,
+          };
+        }
+
+        // Build particle filter from price history
+        const pf = new PredictionMarketParticleFilter({
+          nParticles: 2000,
+          priorProb: 0.50,
+          processVol: 0.03,
+          obsNoise: 0.02,
+        });
+
+        const prices = snapshots.map(s =>
+          params.outcome === "Yes" ? s.yesPrice : s.noPrice,
+        );
+
+        // Process all historical observations
+        for (const price of prices) {
+          pf.update(price);
+        }
+
+        const estimate = pf.estimate();
+        const currentMarketPrice = prices[prices.length - 1];
+        const isSignificant = estimate.divergence > estimate.ci95[1] - estimate.ci95[0];
+
+        return {
+          conditionId: params.conditionId,
+          outcome: params.outcome,
+          currentMarketPrice,
+          filteredProbability: estimate.filteredProb,
+          divergence: estimate.divergence,
+          ci95: estimate.ci95,
+          ess: estimate.ess,
+          isSignificant,
+          signal: isSignificant
+            ? (estimate.filteredProb > currentMarketPrice ? "UNDERPRICED" : "OVERPRICED")
+            : "NEUTRAL",
+          snapshotsUsed: snapshots.length,
+          history: pf.history.slice(-10), // Last 10 filtered values
+        };
+      } catch (err) {
+        return { error: `edge_detection: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    },
+  },
+
+  {
+    name: "backtest_arbitrage",
+    description:
+      "Agent-based backtesting of the pair arbitrage strategy. Simulates a Polymarket " +
+      "order book with informed/noise/market-maker agents, then tests N arbitrage attempts " +
+      "against the simulated environment. Returns completion rate, average P&L, Sharpe ratio, " +
+      "max drawdown, and win rate. Use this to optimize parameters without risking capital.",
+    parameters: BacktestArbitrageSchema,
+    handler: async (params: BacktestArbitrageParams) => {
+      try {
+        return backtestArbitrage({
+          amount: params.amount,
+          margin: params.margin,
+          legTimeoutMs: params.legTimeoutMs || 3000,
+          pollIntervalMs: params.pollIntervalMs || 500,
+          nTrials: params.nTrials || 100,
+          abm: {
+            trueProb: params.trueProb,
+            initialPrice: 0.50,
+          },
+        });
+      } catch (err) {
+        return { error: `backtest_arbitrage: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    },
+  },
+
+  {
+    name: "portfolio_correlation",
+    description:
+      "Analyze tail dependence between correlated prediction market positions using copula models. " +
+      "Compares Gaussian (no tail dependence) vs Student-t (with tail dependence) to quantify " +
+      "how much extreme co-movements increase portfolio risk. Use this when holding multiple " +
+      "positions to understand concentration risk.",
+    parameters: PortfolioCorrelationSchema,
+    handler: async (params: PortfolioCorrelationParams) => {
+      try {
+        if (params.conditionIds.length < 2) {
+          return { error: "Need at least 2 condition IDs to compute correlation." };
+        }
+
+        // Gather price histories
+        const priceHistories: number[][] = [];
+        const marketInfo: Array<{ conditionId: string; snapshotCount: number }> = [];
+
+        for (const conditionId of params.conditionIds) {
+          const snapshots = getStoredHistory(conditionId);
+          if (snapshots.length < 5) {
+            return {
+              error: "NOT_ENOUGH_DATA",
+              conditionId,
+              snapshotsAvailable: snapshots.length,
+              required: 5,
+              message: `Need at least 5 snapshots for ${conditionId}, have ${snapshots.length}.`,
+            };
+          }
+          priceHistories.push(snapshots.map(s => s.yesPrice));
+          marketInfo.push({ conditionId, snapshotCount: snapshots.length });
+        }
+
+        // Build correlation matrix from price histories
+        const corrMatrix = buildCorrelationMatrix(priceHistories);
+
+        // Get current prices for risk assessment
+        const positions = params.conditionIds.map((conditionId, i) => {
+          const snapshots = getStoredHistory(conditionId);
+          const lastPrice = snapshots[snapshots.length - 1].yesPrice;
+          return {
+            prob: lastPrice,
+            size: 10, // Default position size for analysis
+            expectedPnl: lastPrice * 0.05, // Assume 5% edge as baseline
+          };
+        });
+
+        // Assess risk under t-copula (captures tail dependence)
+        const risk = assessPortfolioRisk(positions, corrMatrix, "t");
+
+        return {
+          markets: marketInfo,
+          correlationMatrix: corrMatrix.map((row: number[]) =>
+            row.map((v: number) => Math.round(v * 10000) / 10000)
+          ),
+          portfolioRisk: risk,
+          insight: risk.correlationImpact > 1.5
+            ? "HIGH CORRELATION RISK: Tail dependence significantly increases joint loss probability. Consider diversifying."
+            : risk.correlationImpact > 1.1
+            ? "MODERATE CORRELATION: Some tail dependence present. Monitor joint exposure."
+            : "LOW CORRELATION: Positions are relatively independent. Diversification benefit is strong.",
+        };
+      } catch (err) {
+        return { error: `portfolio_correlation: ${err instanceof Error ? err.message : String(err)}` };
       }
     },
   },
