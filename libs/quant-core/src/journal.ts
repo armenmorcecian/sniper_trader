@@ -207,6 +207,21 @@ function runMigrations(db: DatabaseSync): void {
   if (!hasColumn(db, "daily_summary", "profit_factor")) {
     db.exec("ALTER TABLE daily_summary ADD COLUMN profit_factor REAL");
   }
+
+  // calibration_log: prediction calibration tracking (Brier score)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS calibration_log (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      condition_id    TEXT NOT NULL,
+      predicted_prob  REAL NOT NULL,
+      actual_outcome  INTEGER,
+      source          TEXT NOT NULL,
+      logged_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      resolved_at     TEXT
+    )
+  `);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_calibration_source ON calibration_log(source)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_calibration_cid ON calibration_log(condition_id)");
 }
 
 // ─── Connection ─────────────────────────────────────────────────────────────
@@ -680,5 +695,146 @@ function safeJsonParse(str: string | null | undefined): Record<string, unknown> 
     return JSON.parse(str);
   } catch {
     return {};
+  }
+}
+
+// ─── Calibration Tracking (Brier Score) ─────────────────────────────────────
+
+export interface CalibrationEntry {
+  id?: number;
+  conditionId: string;
+  predictedProb: number;
+  actualOutcome?: number; // 1 = Yes, 0 = No, undefined = unresolved
+  source: string;         // "market_price", "particle_filter", "mc_simulation"
+  loggedAt?: string;
+  resolvedAt?: string;
+}
+
+export interface CalibrationMetrics {
+  brierScore: number;
+  nPredictions: number;
+  nResolved: number;
+  calibrationByBucket: Array<{
+    bucket: string;
+    predicted: number;
+    actual: number;
+    count: number;
+  }>;
+}
+
+/**
+ * Log a probability prediction for later calibration analysis.
+ */
+export function logPrediction(
+  conditionId: string,
+  predictedProb: number,
+  source: string,
+  dbPath?: string,
+): number {
+  const { db, pooled } = getDb(dbPath);
+  try {
+    const result = db.prepare(`
+      INSERT INTO calibration_log (condition_id, predicted_prob, source)
+      VALUES (:conditionId, :predictedProb, :source)
+    `).run({ conditionId, predictedProb, source });
+    return Number(result.lastInsertRowid);
+  } finally {
+    if (!pooled) db.close();
+  }
+}
+
+/**
+ * Resolve a prediction with the actual outcome (1 = Yes, 0 = No).
+ * Resolves ALL unresolved predictions for the given conditionId.
+ */
+export function resolvePrediction(
+  conditionId: string,
+  actualOutcome: 0 | 1,
+  dbPath?: string,
+): number {
+  const { db, pooled } = getDb(dbPath);
+  try {
+    const result = db.prepare(`
+      UPDATE calibration_log
+      SET actual_outcome = :actualOutcome,
+          resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE condition_id = :conditionId AND actual_outcome IS NULL
+    `).run({ conditionId, actualOutcome });
+    return Number(result.changes);
+  } finally {
+    if (!pooled) db.close();
+  }
+}
+
+/**
+ * Compute calibration metrics (Brier score + calibration by bucket).
+ * Only uses resolved predictions (those with actual_outcome IS NOT NULL).
+ */
+export function getCalibrationMetrics(
+  source?: string,
+  dbPath?: string,
+): CalibrationMetrics {
+  const { db, pooled } = getDb(dbPath);
+  try {
+    const conditions = ["actual_outcome IS NOT NULL"];
+    const params: Record<string, string | number> = {};
+
+    if (source) {
+      conditions.push("source = :source");
+      params.source = source;
+    }
+
+    const whereClause = conditions.join(" AND ");
+    const allRows = db.prepare(
+      `SELECT predicted_prob, actual_outcome FROM calibration_log WHERE ${whereClause}`,
+    ).all(params) as { predicted_prob: number; actual_outcome: number }[];
+
+    const totalPredictions = db.prepare(
+      `SELECT COUNT(*) as cnt FROM calibration_log ${source ? "WHERE source = :source" : ""}`,
+    ).get(source ? { source } : {}) as { cnt: number };
+
+    if (allRows.length === 0) {
+      return {
+        brierScore: 0,
+        nPredictions: totalPredictions.cnt,
+        nResolved: 0,
+        calibrationByBucket: [],
+      };
+    }
+
+    // Brier score: mean((predicted - actual)^2)
+    let bsSum = 0;
+    for (const row of allRows) {
+      bsSum += (row.predicted_prob - row.actual_outcome) ** 2;
+    }
+    const brierScore = Math.round((bsSum / allRows.length) * 10000) / 10000;
+
+    // Calibration by bucket: group predictions into 10 bins [0-0.1, 0.1-0.2, ...]
+    const buckets: Map<string, { sumPred: number; sumActual: number; count: number }> = new Map();
+    for (const row of allRows) {
+      const bucketIdx = Math.min(9, Math.floor(row.predicted_prob * 10));
+      const bucketLabel = `${(bucketIdx * 10).toFixed(0)}-${((bucketIdx + 1) * 10).toFixed(0)}%`;
+      const bucket = buckets.get(bucketLabel) || { sumPred: 0, sumActual: 0, count: 0 };
+      bucket.sumPred += row.predicted_prob;
+      bucket.sumActual += row.actual_outcome;
+      bucket.count++;
+      buckets.set(bucketLabel, bucket);
+    }
+
+    const calibrationByBucket = Array.from(buckets.entries()).map(([bucket, data]) => ({
+      bucket,
+      predicted: Math.round((data.sumPred / data.count) * 10000) / 10000,
+      actual: Math.round((data.sumActual / data.count) * 10000) / 10000,
+      count: data.count,
+    }));
+
+    return {
+      brierScore,
+      nPredictions: totalPredictions.cnt,
+      nResolved: allRows.length,
+      calibrationByBucket,
+    };
+  } finally {
+    if (!pooled) db.close();
   }
 }
