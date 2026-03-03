@@ -99,21 +99,15 @@ export class PolymarketService {
       let derivedCreds: ApiKeyCreds;
       try {
         derivedCreds = await withRetry(() =>
-          tempClient.createOrDeriveApiKey(),
+          tempClient.deriveApiKey(),
         );
       } catch (err) {
-        // createOrDeriveApiKey() returns 400 — non-fatal, fall back to getApiKeys()
+        // deriveApiKey() failed — fall back to createOrDeriveApiKey() for first-time setup
         console.warn(
-          "[PolymarketService] createOrDeriveApiKey failed, falling back to getApiKeys():",
+          "[PolymarketService] deriveApiKey failed, falling back to createOrDeriveApiKey():",
           err instanceof Error ? err.message : String(err),
         );
-        const response = await tempClient.getApiKeys();
-        if (!response?.apiKeys || response.apiKeys.length === 0) {
-          throw new Error(
-            "No API keys found and createOrDeriveApiKey failed. Cannot initialize CLOB client.",
-          );
-        }
-        derivedCreds = response.apiKeys[0];
+        derivedCreds = await tempClient.createOrDeriveApiKey();
       }
 
       this.clobClient = new ClobClient(

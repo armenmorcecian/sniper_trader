@@ -3,7 +3,7 @@
 // Uses node:https — no new dependencies. Gracefully skips if env vars missing.
 
 import * as https from "https";
-import { getPerformanceMetrics } from "quant-core/src/performance";
+import { getPerformanceMetrics } from "quant-core";
 import { queryTrades } from "quant-core";
 
 function sendTelegramMessage(text: string): Promise<void> {

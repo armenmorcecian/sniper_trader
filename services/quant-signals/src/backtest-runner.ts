@@ -17,7 +17,7 @@ dotenv.config({
 import { AlpacaDataClient } from "./alpaca-client";
 import { SECTOR_UNIVERSE } from "./helpers";
 import { validateBars, runBacktest } from "quant-core";
-import type { BacktestConfig } from "quant-core/src/backtest";
+import type { BacktestConfig } from "quant-core";
 import type { AlpacaDataConfig } from "./types";
 
 async function main(): Promise<void> {

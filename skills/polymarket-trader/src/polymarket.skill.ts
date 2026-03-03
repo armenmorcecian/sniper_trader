@@ -14,8 +14,8 @@ import {
   recordTrade, queryTrades, getDailySummary, getTradesToday, recordEquitySnapshot,
   PredictionMarketParticleFilter, getCalibrationMetrics,
   buildCorrelationMatrix, assessPortfolioRisk, calibrateCopulaDf,
+  getPerformanceMetrics,
 } from "quant-core";
-import { getPerformanceMetrics } from "quant-core/src/performance";
 import type { TradeEntry } from "quant-core";
 
 // ─── Error Formatting ────────────────────────────────────────────────────────
