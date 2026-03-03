@@ -158,7 +158,7 @@ export class PolymarketService {
           const resp = await axios({
             method: "GET",
             url: endpoint,
-            headers: { "User-Agent": "@polymarket/clob-client", Accept: "*/*" },
+            headers: { ...(options?.headers || {}), "User-Agent": "@polymarket/clob-client", Accept: "*/*" },
             params: options?.params,
             httpsAgent: agent,
             httpAgent: agent,
