@@ -11,7 +11,7 @@ import cron from "node-cron";
 import { computeAll } from "./compute";
 import { sendDailyDigest } from "./daily-digest";
 
-const CRON_SCHEDULE = "*/15 9-16 * * 1-5"; // every 15 min, Mon-Fri 9AM-4PM ET
+const CRON_SCHEDULE = "*/30 9-16 * * 1-5"; // every 30 min, Mon-Fri 9AM-4PM ET
 
 async function main(): Promise<void> {
   console.log("[quant-signals] Starting quant signal service...");

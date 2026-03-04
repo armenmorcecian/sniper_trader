@@ -14,6 +14,7 @@ services:
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
       - ${OPENCLAW_CONFIG_DIR}/signals:/home/node/.openclaw/signals
+      - signals-native:/home/node/signals-native
     ports:
       - "${OPENCLAW_GATEWAY_PORT:-18789}:18789"
       - "${OPENCLAW_BRIDGE_PORT:-18790}:18790"
@@ -25,6 +26,7 @@ services:
 
   quant-signals:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
+    user: "root"
     environment:
       HOME: /home/node
       TERM: xterm-256color
@@ -34,8 +36,9 @@ services:
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
       - ${OPENCLAW_CONFIG_DIR}/signals:/home/node/.openclaw/signals
+      - signals-native:/home/node/signals-native
     working_dir: /home/node/.openclaw/workspace/services/quant-signals
-    entrypoint: ["npx", "tsx", "src/index.ts"]
+    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec su -s /bin/sh node -c 'exec npx tsx src/index.ts'"]
     init: true
     restart: unless-stopped
     healthcheck:
@@ -47,6 +50,7 @@ services:
 
   risk-monitor:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
+    user: "root"
     environment:
       HOME: /home/node
       TERM: xterm-256color
@@ -56,12 +60,37 @@ services:
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
       - ${OPENCLAW_CONFIG_DIR}/signals:/home/node/.openclaw/signals
+      - signals-native:/home/node/signals-native
     working_dir: /home/node/.openclaw/workspace/services/risk-monitor
-    entrypoint: ["npx", "tsx", "src/index.ts"]
+    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec su -s /bin/sh node -c 'exec npx tsx src/index.ts'"]
     init: true
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "node", "-e", "const f=require('fs'),p=require('path');const m=JSON.parse(f.readFileSync(p.join(process.env.HOME,'.openclaw','signals','risk-monitor-meta.json'),'utf-8'));const age=(Date.now()-new Date(m.lastPing).getTime())/60000;process.exit(age>5?1:0)"]
+      interval: 3m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  poly-monitor:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    user: "root"
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+    env_file:
+      - ${OPENCLAW_CONFIG_DIR}/.env
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+      - ${OPENCLAW_CONFIG_DIR}/signals:/home/node/.openclaw/signals
+      - signals-native:/home/node/signals-native
+    working_dir: /home/node/.openclaw/workspace/services/poly-monitor
+    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec su -s /bin/sh node -c 'exec npx tsx src/index.ts'"]
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "const f=require('fs'),p=require('path');const m=JSON.parse(f.readFileSync(p.join(process.env.HOME,'.openclaw','signals','poly-monitor-meta.json'),'utf-8'));const age=(Date.now()-new Date(m.lastPing).getTime())/60000;process.exit(age>5?1:0)"]
       interval: 3m
       timeout: 10s
       retries: 3
@@ -84,3 +113,6 @@ services:
     tty: true
     init: true
     entrypoint: ["node", "dist/index.js"]
+
+volumes:
+  signals-native:
