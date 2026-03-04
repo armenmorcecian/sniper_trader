@@ -37,14 +37,20 @@ export class PolymarketService {
   constructor(config: PolymarketConfig) {
     this.config = config;
 
+    const agentOpts = config.proxyUrl
+      ? { httpsAgent: new HttpsProxyAgent(config.proxyUrl), httpAgent: new HttpsProxyAgent(config.proxyUrl) }
+      : {};
+
     this.gammaApi = axios.create({
       baseURL: config.gammaHost,
       timeout: 15000,
+      ...agentOpts,
     });
 
     this.dataApi = axios.create({
       baseURL: config.dataHost,
       timeout: 15000,
+      ...agentOpts,
     });
 
     // API health interceptors — track consecutive failures for circuit breaker
@@ -597,27 +603,35 @@ export class PolymarketService {
       ? ((positionsResult as { data: Record<string, unknown>[] }).data)
       : [];
 
-    const positions: PositionSummary[] = rawPositions.map((pos) => {
-      const size = Number(pos.size || 0);
-      const avgPrice = Number(pos.avgPrice || pos.avg_price || 0);
-      const curPrice = Number(pos.curPrice || pos.current_price || 0);
-      const marketValue = size * curPrice;
-      const costBasis = size * avgPrice;
-      const pnl = marketValue - costBasis;
-      const pnlPercent = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
+    const positions: PositionSummary[] = rawPositions
+      .map((pos) => {
+        const size = Number(pos.size || 0);
+        const avgPrice = Number(pos.avgPrice || pos.avg_price || 0);
+        const curPrice = Number(pos.curPrice || pos.current_price || 0);
+        const marketValue = size * curPrice;
+        const costBasis = size * avgPrice;
+        const pnl = marketValue - costBasis;
+        const pnlPercent = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
 
-      return {
-        conditionId: String(pos.conditionId || pos.condition_id || ""),
-        question: String(pos.title || pos.question || ""),
-        outcome: String(pos.outcome || ""),
-        size,
-        avgEntryPrice: avgPrice,
-        currentPrice: curPrice,
-        marketValue,
-        pnl,
-        pnlPercent,
-      };
-    });
+        return {
+          conditionId: String(pos.conditionId || pos.condition_id || ""),
+          question: String(pos.title || pos.question || ""),
+          outcome: String(pos.outcome || ""),
+          size,
+          avgEntryPrice: avgPrice,
+          currentPrice: curPrice,
+          marketValue,
+          pnl,
+          pnlPercent,
+        };
+      })
+      .filter((pos) => {
+        // Resolved losing positions: size > 0 but currentPrice = 0 — no economic value
+        if (pos.size > 0 && pos.currentPrice === 0) return false;
+        // Dust positions worth less than $0.001
+        if (pos.marketValue < 0.001 && pos.size > 0) return false;
+        return true;
+      });
 
     // Determine open order count
     const openOrders = (ordersResult as { data?: unknown[] }).data || [];
