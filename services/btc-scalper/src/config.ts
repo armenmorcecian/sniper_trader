@@ -29,6 +29,7 @@ export interface Config {
   defaultMaxBet: number;
   maxDailyLossPct: number;
   cashReservePct: number;
+  cbMinLossAbs: number;
   maxConcurrentBets: number;
   maxBetsPerHour: number;
   cooldownAfterLossMs: number;
@@ -42,6 +43,7 @@ export interface Config {
   maxHoldElapsed: number;
   trailingTpActivationPct: number;
   trailingTpDropPct: number;
+  momentumReversalThreshold: number;
 
   // Global signal thresholds (defaults for per-asset)
   minMomentumPct: number;
@@ -72,6 +74,10 @@ export interface Config {
 
   // Signal eval interval (buy checks)
   evalIntervalMs: number;
+
+  // Hold grace period (skip exits for young positions)
+  minHoldMs: number;
+  minHoldMs5m: number;
 
   // Exit eval interval (faster TP/SL checks)
   exitIntervalMs: number;
@@ -140,7 +146,7 @@ export function loadConfig(): Config {
   const assets = assetsRaw.split(",").map(s => s.trim().toUpperCase()) as Asset[];
 
   // Global defaults (from BTC_* env vars for backward compat)
-  const defaultMaxBet = Number(process.env.BTC_MAX_BET) || 2.0;
+  const defaultMaxBet = Number(process.env.BTC_MAX_BET) || 1.0;
   const targetTimeframes = (process.env.BTC_TARGET_TIMEFRAMES || "15m").split(",").map(s => s.trim()) as Timeframe[];
   const volScale5m = Number(process.env.BTC_VOL_SCALE_5M) || 0.25;
   const volScale15m = Number(process.env.BTC_VOL_SCALE_15M) || 0.40;
@@ -185,6 +191,7 @@ export function loadConfig(): Config {
     // Global risk controls
     defaultMaxBet,
     maxDailyLossPct: Number(process.env.BTC_MAX_DAILY_LOSS_PCT) || 10,
+    cbMinLossAbs: Number(process.env.BTC_CB_MIN_LOSS_ABS) || 10,
     cashReservePct: Number(process.env.BTC_CASH_RESERVE_PCT) || 20,
     maxConcurrentBets: Number(process.env.BTC_MAX_CONCURRENT_BETS) || 5,
     maxBetsPerHour: Number(process.env.BTC_MAX_BETS_PER_HOUR) || 10,
@@ -199,6 +206,7 @@ export function loadConfig(): Config {
     maxHoldElapsed: Number(process.env.BTC_MAX_HOLD_ELAPSED) || 0.80,
     trailingTpActivationPct: Number(process.env.BTC_TRAILING_TP_ACTIVATION_PCT) || 15,
     trailingTpDropPct: Number(process.env.BTC_TRAILING_TP_DROP_PCT) || 5,
+    momentumReversalThreshold: Number(process.env.BTC_MOMENTUM_REVERSAL_PCT) || 0.15,
 
     // Global signal thresholds
     minMomentumPct,
@@ -217,6 +225,10 @@ export function loadConfig(): Config {
     volScale15m,
     volScale1h,
     volScale4h,
+
+    // Hold grace period
+    minHoldMs: Number(process.env.BTC_MIN_HOLD_MS) || 90_000,
+    minHoldMs5m: Number(process.env.BTC_MIN_HOLD_MS_5M) || 60_000,
 
     // Limit order settings
     useLimitOrders: process.env.BTC_USE_LIMIT_ORDERS !== "false",

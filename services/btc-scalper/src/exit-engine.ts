@@ -19,20 +19,38 @@ export function evaluateExits(
   const signals: ExitSignal[] = [];
   if (positions.length === 0) return signals;
 
+  const cbClaimedIds = new Set<string>();
+
   // ─── Rule 5: Circuit Breaker (all positions) ──────────────────────────
 
   try {
     const dailyRealized = getRealizedPnlToday("polymarket");
+    const now = Date.now();
     const unrealizedPnl = positions.reduce((sum, pos) => {
+      const graceMs = pos.market.timeframe === "5m" ? config.minHoldMs5m : config.minHoldMs;
+      if (now - pos.entryTime < graceMs) return sum; // skip young positions from CB calc
       const curPrice = currentPolyPrices.get(pos.conditionId) ?? pos.entryPrice;
       return sum + (curPrice - pos.entryPrice) * (pos.amount / pos.entryPrice);
     }, 0);
     const totalDailyPnl = dailyRealized + unrealizedPnl;
     const cbResult = checkCircuitBreaker(totalDailyPnl, totalEquity, config.maxDailyLossPct);
 
+    // Absolute floor: don't trip CB if total loss is below minimum
+    if (cbResult.tripped && Math.abs(totalDailyPnl) < config.cbMinLossAbs) {
+      console.log(`${LOG_PREFIX} CB would trip but daily loss $${Math.abs(totalDailyPnl).toFixed(2)} < $${config.cbMinLossAbs} floor — skipping`);
+      cbResult.tripped = false;
+    }
+
     if (cbResult.tripped) {
       console.log(`${LOG_PREFIX} CIRCUIT BREAKER: daily P&L $${totalDailyPnl.toFixed(2)}`);
       for (const pos of positions) {
+        // Skip young positions still in grace period
+        const graceMs = pos.market.timeframe === "5m" ? config.minHoldMs5m : config.minHoldMs;
+        if (now - pos.entryTime < graceMs) {
+          console.log(`${LOG_PREFIX} CB: keeping ${pos.asset} ${pos.market.timeframe} ${pos.side} (grace period, ${((now - pos.entryTime) / 1000).toFixed(0)}s old)`);
+          continue;
+        }
+
         const curPrice = currentPolyPrices.get(pos.conditionId) ?? pos.entryPrice;
         const posPnlPct = ((curPrice - pos.entryPrice) / pos.entryPrice) * 100;
 
@@ -49,8 +67,9 @@ export function evaluateExits(
           urgency: "high",
           currentPrice: curPrice,
         });
+        cbClaimedIds.add(pos.conditionId);
       }
-      if (signals.length > 0) return signals;
+      // No early return — fall through to per-position rules for non-CB positions
     }
   } catch (err) {
     console.error(`${LOG_PREFIX} Circuit breaker check failed (non-fatal):`, err instanceof Error ? err.message : String(err));
@@ -59,6 +78,7 @@ export function evaluateExits(
   // ─── Per-position rules ───────────────────────────────────────────────
 
   for (const pos of positions) {
+    if (cbClaimedIds.has(pos.conditionId)) continue; // already handled by CB
     const pipeline = pipelines.get(pos.asset);
     const tracker = pipeline?.tracker;
     const signal = evaluatePositionRules(pos, tracker, config, currentPolyPrices);
@@ -76,6 +96,13 @@ function evaluatePositionRules(
   config: Config,
   currentPolyPrices: Map<string, number>,
 ): ExitSignal | null {
+  // Grace period: skip all exit rules for young positions
+  const holdMs = Date.now() - pos.entryTime;
+  const minHold = pos.market.timeframe === "5m" ? config.minHoldMs5m : config.minHoldMs;
+  if (holdMs < minHold) {
+    return null;
+  }
+
   const livePrice = currentPolyPrices.get(pos.conditionId);
   if (livePrice === undefined) {
     console.warn(`${LOG_PREFIX} No live price for ${pos.conditionId.slice(0, 12)} — using entry price`);
@@ -157,7 +184,7 @@ function evaluatePositionRules(
     const metrics = tracker.getMetrics(pos.conditionId);
     if (metrics && pnlPct < 0) {
       const entryWasBullish = pos.entryReturnFromOpen > 0;
-      const reversalThreshold = 0.05;
+      const reversalThreshold = config.momentumReversalThreshold;
       const reversed = entryWasBullish
         ? metrics.returnFromOpen < -reversalThreshold
         : metrics.returnFromOpen > reversalThreshold;
