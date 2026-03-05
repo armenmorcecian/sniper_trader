@@ -87,7 +87,7 @@ export { withRetry, isRetryable } from "quant-core";
 export function resolveTokenId(
   outcomes: string[] | string,
   clobTokenIds: string[] | string,
-  targetOutcome: "Yes" | "No",
+  targetOutcome: string,
 ): string {
   const parsedOutcomes: string[] =
     typeof outcomes === "string" ? JSON.parse(outcomes) : outcomes;

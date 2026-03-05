@@ -233,7 +233,7 @@ export class PolymarketService {
                   data: err.response.data,
                 }),
               );
-              return { ...err.response.data, status: err.response.status };
+              throw err;
             }
             throw err;
           }
@@ -416,11 +416,11 @@ export class PolymarketService {
     const depth = analyzeOrderBookDepth(orderBook);
     const avoidance = shouldAvoidMarket(depth, side as "BUY" | "SELL");
     if (avoidance.avoid) {
-      throw new Error(`Trade rejected — ${avoidance.reason}`);
+      console.warn(`[PolymarketService] Whale wall warning (proceeding): ${avoidance.reason}`);
     }
 
-    // Balance check
-    if (side === "BUY") {
+    // Balance check (skip when caller already verified)
+    if (side === "BUY" && !params.skipBalanceChecks) {
       const totalCost = amount * limitPrice;
       const balance = await this.getUsdcBalance();
       if (totalCost > balance) {
@@ -453,7 +453,7 @@ export class PolymarketService {
       ),
     );
 
-    const balanceAfter = await this.getUsdcBalance();
+    const balanceAfter = params.skipBalanceChecks ? 0 : await this.getUsdcBalance();
 
     return {
       orderId: orderResponse.orderID || "",
@@ -492,11 +492,11 @@ export class PolymarketService {
     const depth = analyzeOrderBookDepth(orderBook);
     const avoidance = shouldAvoidMarket(depth, side as "BUY" | "SELL");
     if (avoidance.avoid) {
-      throw new Error(`Trade rejected — ${avoidance.reason}`);
+      console.warn(`[PolymarketService] Whale wall warning (proceeding): ${avoidance.reason}`);
     }
 
-    // Balance check
-    if (side === "BUY") {
+    // Balance check (skip when caller already verified)
+    if (side === "BUY" && !params.skipBalanceChecks) {
       const balance = await this.getUsdcBalance();
       if (amount > balance) {
         throw new InsufficientFundsError(amount, balance);
@@ -524,7 +524,7 @@ export class PolymarketService {
       ),
     );
 
-    const balanceAfter = await this.getUsdcBalance();
+    const balanceAfter = params.skipBalanceChecks ? 0 : await this.getUsdcBalance();
 
     return {
       orderId: orderResponse.orderID || "",
@@ -710,7 +710,7 @@ export class PolymarketService {
    */
   async sellPosition(
     conditionId: string,
-    outcome: "Yes" | "No",
+    outcome: string,
   ): Promise<TradeResult> {
     await this.ensureInitialized();
     const marketData = await this.fetchGammaMarket(conditionId);
@@ -766,7 +766,7 @@ export class PolymarketService {
    */
   async getOrderBookForToken(
     conditionId: string,
-    outcome: "Yes" | "No",
+    outcome: string,
   ): Promise<{
     orderBook: { bids: Array<{ price: string; size: string }>; asks: Array<{ price: string; size: string }> };
     tokenId: string;
@@ -851,7 +851,8 @@ export class PolymarketService {
     }
   }
 
-  private async getUsdcBalance(): Promise<number> {
+  public async getUsdcBalance(): Promise<number> {
+    await this.ensureInitialized();
     const result = await withRetry(() =>
       this.clobClient.getBalanceAllowance({
         asset_type: AssetType.COLLATERAL,

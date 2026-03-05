@@ -130,8 +130,8 @@ export interface MarketScanResult {
 export interface TradeParams {
   /** Market condition ID */
   marketConditionId: string;
-  /** "Yes" or "No" */
-  outcome: "Yes" | "No";
+  /** Outcome name (e.g., "Yes", "No", "Up", "Down") */
+  outcome: string;
   /** BUY or SELL */
   side: "BUY" | "SELL";
   /** Amount in USDC */
@@ -140,12 +140,14 @@ export interface TradeParams {
   limitPrice?: number;
   /** GTC (default) or FOK for market orders */
   orderType?: "GTC" | "FOK";
+  /** Skip pre/post-order balance checks (used by scalper for speed) */
+  skipBalanceChecks?: boolean;
 }
 
 export interface TradeResult {
   orderId: string;
   side: "BUY" | "SELL";
-  outcome: "Yes" | "No";
+  outcome: string;
   price: number;
   size: number;
   totalCost: number;
