@@ -72,66 +72,12 @@ services:
       retries: 3
       start_period: 30s
 
-  poly-monitor:
-    image: ${OPENCLAW_IMAGE:-openclaw:local}
-    user: "root"
-    environment:
-      HOME: /home/node
-      TERM: xterm-256color
-    env_file:
-      - ${OPENCLAW_CONFIG_DIR}/.env
-    volumes:
-      - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
-      - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
-      - ${OPENCLAW_CONFIG_DIR}/signals:/home/node/.openclaw/signals
-      - signals-native:/home/node/signals-native
-    working_dir: /home/node/.openclaw/workspace/services/poly-monitor
-    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec su -s /bin/sh node -c 'exec npx tsx src/index.ts'"]
-    init: true
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "node", "-e", "const f=require('fs'),p=require('path');const m=JSON.parse(f.readFileSync(p.join(process.env.HOME,'.openclaw','signals','poly-monitor-meta.json'),'utf-8'));const age=(Date.now()-new Date(m.lastPing).getTime())/60000;process.exit(age>5?1:0)"]
-      interval: 3m
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-
   btc-scalper:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
     user: "root"
     environment:
       HOME: /home/node
       TERM: xterm-256color
-      # Exit strategy — sell earlier, take profits faster (v4)
-      BTC_BASE_TAKE_PROFIT_PCT: "15"
-      BTC_TP_DECAY_FACTOR: "0.6"
-      BTC_BASE_STOP_LOSS_PCT: "12"
-      BTC_SL_TIGHTEN_FACTOR: "0.4"
-      BTC_MAX_HOLD_ELAPSED: "0.82"
-      # Limit order settings
-      BTC_USE_LIMIT_ORDERS: "true"
-      BTC_LIMIT_ORDER_TIMEOUT_MS: "8000"
-      BTC_LIMIT_ORDER_POLL_MS: "1500"
-      # Entry strategy — opened up for volume (v4)
-      BTC_TARGET_TIMEFRAMES: "5m,15m,1h,4h"
-      BTC_COOLDOWN_AFTER_LOSS_MS: "15000"
-      BTC_MAX_BET: "5.0"
-      BTC_MAX_ELAPSED: "0.75"
-      BTC_MAX_ELAPSED_5M: "0.50"
-      BTC_MIN_LIQUIDITY: "1500"
-      BTC_VOL_SCALE_5M: "0.25"
-      BTC_VOL_SCALE_15M: "0.40"
-      BTC_MAX_ENTRY_PRICE: "0.55"
-      BTC_MIN_ELAPSED: "0.25"
-      BTC_MIN_EDGE: "0.06"
-      BTC_MIN_MOMENTUM_PCT: "0.10"
-      BTC_MAX_BETS_PER_HOUR: "15"
-      BTC_MAX_CONCURRENT_BETS: "5"
-      # Speed — faster loops (v4)
-      BTC_MARKET_POLL_MS: "15000"
-      BTC_EVAL_INTERVAL_MS: "3000"
-      BTC_DEBUG_SIGNALS: "true"
-      SCALPER_ASSETS: "BTC,ETH"
     env_file:
       - ${OPENCLAW_CONFIG_DIR}/.env
     volumes:
@@ -149,6 +95,54 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+
+  penny-collector:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    user: "root"
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+    env_file:
+      - ${OPENCLAW_CONFIG_DIR}/.env
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+      - ${OPENCLAW_CONFIG_DIR}/signals:/home/node/.openclaw/signals
+      - signals-native:/home/node/signals-native
+    working_dir: /home/node/.openclaw/workspace/services/penny-collector
+    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec su -s /bin/sh node -c 'exec npx tsx src/index.ts'"]
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "const f=require('fs'),p=require('path');const m=JSON.parse(f.readFileSync(p.join(process.env.HOME,'.openclaw','signals','penny-collector-meta.json'),'utf-8'));const age=(Date.now()-new Date(m.lastPing).getTime())/60000;process.exit(age>5?1:0)"]
+      interval: 3m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  copycat-wallet:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    user: "root"
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+    env_file:
+      - ${OPENCLAW_CONFIG_DIR}/.env
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+      - ${OPENCLAW_CONFIG_DIR}/signals:/home/node/.openclaw/signals
+      - signals-native:/home/node/signals-native
+    working_dir: /home/node/.openclaw/workspace/services/copycat-wallet
+    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec su -s /bin/sh node -c 'exec npx tsx src/index.ts'"]
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "const f=require('fs'),p=require('path');const m=JSON.parse(f.readFileSync(p.join(process.env.HOME,'.openclaw','signals','copycat-wallet-meta.json'),'utf-8'));const age=(Date.now()-new Date(m.lastPing).getTime())/60000;process.exit(age>5?1:0)"]
+      interval: 3m
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   openclaw-cli:
     image: ${OPENCLAW_IMAGE:-openclaw:local}

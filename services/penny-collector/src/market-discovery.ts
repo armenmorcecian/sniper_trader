@@ -7,7 +7,7 @@
 import axios from "axios";
 import type { CandleMarket, Asset, Timeframe } from "./types";
 import { ASSET_SLUG_PREFIX, ASSET_HOURLY_SLUG_PREFIX } from "./types";
-import type { AssetConfig } from "./config";
+import type { AssetConfig } from "./types";
 
 const LOG_PREFIX = "[market-discovery]";
 
@@ -78,7 +78,7 @@ export class MarketDiscovery {
       this.lastPoll = Date.now();
       return markets;
     } catch (err) {
-      console.error(`${LOG_PREFIX} Gamma API poll failed:`, err instanceof Error ? err.message : String(err));
+      console.warn(`${LOG_PREFIX} Gamma API poll failed (using cache):`, err instanceof Error ? err.message : String(err));
       return this.cache; // Return stale cache on error
     }
   }
@@ -276,7 +276,7 @@ export class MarketDiscovery {
           const remainMin = Math.floor(remainSec / 60);
           const remainS = remainSec % 60;
           const liqStr = m.liquidityNum >= 1000 ? `$${(m.liquidityNum / 1000).toFixed(0)}K` : `$${m.liquidityNum.toFixed(0)}`;
-          return `${m.timeframe}(Up:${m.outcomePrices[0].toFixed(2)} liq=${liqStr}, ${remainMin}m${remainS}s)`;
+          return `${m.timeframe}(liq=${liqStr}, ${remainMin}m${remainS}s)`;
         }).join(", ");
         parts.push(`${asset}=[${marketStrs}]`);
       }

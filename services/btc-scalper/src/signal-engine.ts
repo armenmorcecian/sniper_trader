@@ -7,6 +7,7 @@ import type { Config, AssetConfig } from "./config";
 import type { CandleMarket, ScalpSignal, Timeframe } from "./types";
 import type { CandleTracker, CandleMetrics } from "./candle-tracker";
 import type { VolTracker } from "./vol-tracker";
+import type { OrderBookFeed } from "./orderbook-feed";
 
 const LOG_PREFIX = "[signal-engine]";
 const DEBUG_SIGNALS = process.env.BTC_DEBUG_SIGNALS === "true";
@@ -40,6 +41,7 @@ export function evaluateSignals(
   assetConfig: AssetConfig,
   volTracker?: VolTracker,
   allAssetMarkets?: CandleMarket[],
+  obiFeed?: OrderBookFeed,
 ): ScalpSignal[] {
   const signals: ScalpSignal[] = [];
   const tfMarkets = allAssetMarkets ?? markets;
@@ -51,7 +53,7 @@ export function evaluateSignals(
     const metrics = tracker.getMetrics(market.conditionId);
     if (!metrics) continue;
 
-    const signal = evaluateMarket(market, metrics, config, assetConfig, volTracker, tfMarkets);
+    const signal = evaluateMarket(market, metrics, config, assetConfig, volTracker, tfMarkets, obiFeed);
     if (signal) {
       signals.push(signal);
     }
@@ -91,14 +93,22 @@ function evaluateMarket(
   assetConfig: AssetConfig,
   volTracker?: VolTracker,
   allMarkets?: CandleMarket[],
+  obiFeed?: OrderBookFeed,
 ): ScalpSignal | null {
   const { returnFromOpen, vwapDeviation, flowRatio, elapsed } = metrics;
   let reject = "";
 
   // ─── Timing Window ──────────────────────────────────────────────────────
-  const maxElapsed = market.timeframe === "5m" ? config.maxElapsed5m : config.maxElapsed;
-  if (elapsed < config.minElapsed || elapsed > maxElapsed) {
-    reject = `timing(${(elapsed * 100).toFixed(0)}%,min=${(config.minElapsed * 100).toFixed(0)}%,max=${(maxElapsed * 100).toFixed(0)}%)`;
+  const maxElapsed = market.timeframe === "5m" ? config.maxElapsed5m
+    : market.timeframe === "1h" ? config.maxElapsed1h
+    : market.timeframe === "4h" ? config.maxElapsed4h
+    : config.maxElapsed;
+  const minElapsed = market.timeframe === "15m" ? config.minElapsed15m
+    : market.timeframe === "1h" ? config.minElapsed1h
+    : market.timeframe === "4h" ? config.minElapsed4h
+    : config.minElapsed;
+  if (elapsed < minElapsed || elapsed > maxElapsed) {
+    reject = `timing(${(elapsed * 100).toFixed(0)}%,min=${(minElapsed * 100).toFixed(0)}%,max=${(maxElapsed * 100).toFixed(0)}%)`;
   }
 
   // ─── Layer 1: Momentum ──────────────────────────────────────────────────
@@ -135,6 +145,17 @@ function evaluateMarket(
     }
   }
 
+  // ─── Layer 4: Multi-Exchange Order Book Imbalance ─────────────────────
+  if (!reject && obiFeed?.isReady) {
+    const obi = obiFeed.lastObi;
+    if (obi && obi.exchangeCount >= 2) {
+      const obiConfirms = momentumUp ? obi.obi > config.obiMinConfirmation : obi.obi < -config.obiMinConfirmation;
+      if (!obiConfirms) {
+        reject = `obi(${obi.obi.toFixed(3)},need=${momentumUp ? ">" : "<"}${config.obiMinConfirmation})`;
+      }
+    }
+  }
+
   // ─── Edge Calculation ───────────────────────────────────────────────────
   const volScale = getVolScale(assetConfig, market.timeframe, volTracker);
   const probUp = sigmoid(returnFromOpen / volScale);
@@ -146,8 +167,8 @@ function evaluateMarket(
     reject = `price-invalid(${marketPrice})`;
   }
 
-  if (!reject && marketPrice > 0.85) {
-    reject = `price-ceiling(${marketPrice.toFixed(3)}>0.85)`;
+  if (!reject && marketPrice < config.minEntryPrice) {
+    reject = `entry-price-low(${marketPrice.toFixed(3)}<${config.minEntryPrice})`;
   }
 
   if (!reject && marketPrice > config.maxEntryPrice) {
@@ -167,7 +188,14 @@ function evaluateMarket(
 
   // Our fair value for the side we're buying
   const fairValue = side === "Up" ? probUp : 1 - probUp;
-  const edge = fairValue * (1 - config.polyFeeRate) - marketPrice;
+  const polySpread = Math.abs(1 - market.outcomePrices[0] - market.outcomePrices[1]);
+  const spreadCost = polySpread / 2;
+  const estimatedSlippage = market.liquidityNum > 0
+    ? (assetConfig.maxBet / market.liquidityNum) * 0.5
+    : 0.01;
+  // Actual Polymarket fee curve: fee = p × feeRate × (p × (1-p))^exponent
+  const feesCost = marketPrice * 0.25 * Math.pow(marketPrice * (1 - marketPrice), 2);
+  const edge = fairValue - marketPrice - spreadCost - estimatedSlippage - feesCost;
 
   if (!reject && edge < assetConfig.minEdge) {
     reject = `edge(${edge.toFixed(3)}<${assetConfig.minEdge})`;

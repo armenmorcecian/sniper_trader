@@ -56,6 +56,14 @@ export interface PolymarketConfig {
   newsApiKey?: string;
   /** Residential proxy URL for order placement (e.g. http://user:pass@host:port) */
   proxyUrl?: string;
+  /** Polygon HTTP RPC for on-chain redemption (e.g. https://polygon-mainnet.g.alchemy.com/v2/{key}) */
+  polygonRpc?: string;
+  /** Builder API key for gasless relayer transactions */
+  builderApiKey?: string;
+  /** Builder API secret */
+  builderSecret?: string;
+  /** Builder API passphrase */
+  builderPassphrase?: string;
 }
 
 // ─── Market Scanning ────────────────────────────────────────────────────────

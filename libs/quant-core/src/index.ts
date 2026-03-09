@@ -131,6 +131,9 @@ export {
   buildCorrelationMatrix,
   assessPortfolioRisk,
   calibrateCopulaDf,
+  normalCdf,
+  studentTCdf,
+  computeTailDependence,
 } from "./copula";
 export type { CopulaResult, PortfolioRisk } from "./copula";
 

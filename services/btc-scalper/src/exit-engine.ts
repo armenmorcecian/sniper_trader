@@ -1,8 +1,9 @@
 // ─── Exit Engine ─────────────────────────────────────────────────────────────
-// Dynamic take-profit / stop-loss / momentum reversal / time-decay exit rules.
+// Profit-only exit strategy: only sell when profitable or at candle time limit.
 // Never hold to resolution — sell the contract to capture the price move.
 
-import { checkCircuitBreaker, getRealizedPnlToday } from "quant-core";
+// Circuit breaker exit disabled — imports kept for reference
+// import { checkCircuitBreaker, getRealizedPnlToday } from "quant-core";
 import type { Config } from "./config";
 import type { Asset, AssetPipeline, ExitSignal, OpenPosition } from "./types";
 import { TIMEFRAME_SECONDS } from "./types";
@@ -19,66 +20,11 @@ export function evaluateExits(
   const signals: ExitSignal[] = [];
   if (positions.length === 0) return signals;
 
-  const cbClaimedIds = new Set<string>();
-
-  // ─── Rule 5: Circuit Breaker (all positions) ──────────────────────────
-
-  try {
-    const dailyRealized = getRealizedPnlToday("polymarket");
-    const now = Date.now();
-    const unrealizedPnl = positions.reduce((sum, pos) => {
-      const graceMs = pos.market.timeframe === "5m" ? config.minHoldMs5m : config.minHoldMs;
-      if (now - pos.entryTime < graceMs) return sum; // skip young positions from CB calc
-      const curPrice = currentPolyPrices.get(pos.conditionId) ?? pos.entryPrice;
-      return sum + (curPrice - pos.entryPrice) * (pos.amount / pos.entryPrice);
-    }, 0);
-    const totalDailyPnl = dailyRealized + unrealizedPnl;
-    const cbResult = checkCircuitBreaker(totalDailyPnl, totalEquity, config.maxDailyLossPct);
-
-    // Absolute floor: don't trip CB if total loss is below minimum
-    if (cbResult.tripped && Math.abs(totalDailyPnl) < config.cbMinLossAbs) {
-      console.log(`${LOG_PREFIX} CB would trip but daily loss $${Math.abs(totalDailyPnl).toFixed(2)} < $${config.cbMinLossAbs} floor — skipping`);
-      cbResult.tripped = false;
-    }
-
-    if (cbResult.tripped) {
-      console.log(`${LOG_PREFIX} CIRCUIT BREAKER: daily P&L $${totalDailyPnl.toFixed(2)}`);
-      for (const pos of positions) {
-        // Skip young positions still in grace period
-        const graceMs = pos.market.timeframe === "5m" ? config.minHoldMs5m : config.minHoldMs;
-        if (now - pos.entryTime < graceMs) {
-          console.log(`${LOG_PREFIX} CB: keeping ${pos.asset} ${pos.market.timeframe} ${pos.side} (grace period, ${((now - pos.entryTime) / 1000).toFixed(0)}s old)`);
-          continue;
-        }
-
-        const curPrice = currentPolyPrices.get(pos.conditionId) ?? pos.entryPrice;
-        const posPnlPct = ((curPrice - pos.entryPrice) / pos.entryPrice) * 100;
-
-        // Only exit losing positions — profitable ones are helping recovery
-        if (posPnlPct >= 0) {
-          console.log(`${LOG_PREFIX} CB: keeping ${pos.asset} ${pos.market.timeframe} ${pos.side} (P&L +${posPnlPct.toFixed(1)}%)`);
-          continue;
-        }
-
-        signals.push({
-          conditionId: pos.conditionId,
-          rule: "circuit_breaker",
-          reason: `Daily loss $${totalDailyPnl.toFixed(2)} exceeded -${config.maxDailyLossPct}% of equity`,
-          urgency: "high",
-          currentPrice: curPrice,
-        });
-        cbClaimedIds.add(pos.conditionId);
-      }
-      // No early return — fall through to per-position rules for non-CB positions
-    }
-  } catch (err) {
-    console.error(`${LOG_PREFIX} Circuit breaker check failed (non-fatal):`, err instanceof Error ? err.message : String(err));
-  }
+  // ─── Rule 5: Circuit Breaker — DISABLED (no exits) ──────────────────
 
   // ─── Per-position rules ───────────────────────────────────────────────
 
   for (const pos of positions) {
-    if (cbClaimedIds.has(pos.conditionId)) continue; // already handled by CB
     const pipeline = pipelines.get(pos.asset);
     const tracker = pipeline?.tracker;
     const signal = evaluatePositionRules(pos, tracker, config, currentPolyPrices);
@@ -108,6 +54,28 @@ function evaluatePositionRules(
     console.warn(`${LOG_PREFIX} No live price for ${pos.conditionId.slice(0, 12)} — using entry price`);
   }
   const curPrice = livePrice ?? pos.entryPrice;
+
+  // Skip dynamic TP evaluation if GTC TP is active (exchange manages the TP)
+  if (pos.tpOrderId) {
+    const candleStartMs = pos.market.startDate
+      ? new Date(pos.market.startDate).getTime()
+      : new Date(pos.market.endDate).getTime() - (TIMEFRAME_SECONDS[pos.market.timeframe] || 300) * 1000;
+    const candleEndMs = new Date(pos.market.endDate).getTime();
+    const candleDurationMs = candleEndMs - candleStartMs;
+    const elapsed = candleDurationMs > 0 ? Math.min(Math.max((Date.now() - candleStartMs) / candleDurationMs, 0), 1.0) : 0;
+
+    if (elapsed >= config.maxHoldElapsed) {
+      return {
+        conditionId: pos.conditionId,
+        rule: "time_decay",
+        reason: `Candle ${(elapsed * 100).toFixed(0)}% elapsed — cancelling GTC TP and force-selling`,
+        urgency: "high",
+        currentPrice: curPrice,
+      };
+    }
+    return null;
+  }
+
   const pnlPct = ((curPrice - pos.entryPrice) / pos.entryPrice) * 100;
 
   // Update high-water mark for trailing TP
@@ -164,43 +132,16 @@ function evaluatePositionRules(
     };
   }
 
-  // ─── Rule 2: Dynamic Stop-Loss ────────────────────────────────────────
-
-  const stopLossPct = config.baseStopLossPct * (1 - elapsed * config.slTightenFactor);
-  if (pnlPct <= -stopLossPct) {
-    console.log(`${LOG_PREFIX} STOP-LOSS: ${pos.asset} ${pos.market.timeframe} ${pos.side} — P&L ${pnlPct.toFixed(1)}% <= -${stopLossPct.toFixed(1)}%`);
+  // ─── Rule 2: Stop-Loss ────────────────────────────────────────────────
+  if (pnlPct <= -config.baseStopLossPct) {
+    console.log(`${LOG_PREFIX} STOP-LOSS: ${pos.asset} ${pos.market.timeframe} ${pos.side} — P&L ${pnlPct.toFixed(1)}%`);
     return {
       conditionId: pos.conditionId,
       rule: "stop_loss",
-      reason: `P&L ${pnlPct.toFixed(1)}% hit dynamic stop -${stopLossPct.toFixed(1)}% (elapsed ${(elapsed * 100).toFixed(0)}%)`,
+      reason: `P&L ${pnlPct.toFixed(1)}% hit stop at -${config.baseStopLossPct}%`,
       urgency: "high",
       currentPrice: curPrice,
     };
-  }
-
-  // ─── Rule 3: Momentum Reversal ────────────────────────────────────────
-
-  if (tracker) {
-    const metrics = tracker.getMetrics(pos.conditionId);
-    if (metrics && pnlPct < 0) {
-      const entryWasBullish = pos.entryReturnFromOpen > 0;
-      const reversalThreshold = config.momentumReversalThreshold;
-      const reversed = entryWasBullish
-        ? metrics.returnFromOpen < -reversalThreshold
-        : metrics.returnFromOpen > reversalThreshold;
-
-      if (reversed) {
-        const currentIsBullish = metrics.returnFromOpen > 0;
-        console.log(`${LOG_PREFIX} MOMENTUM-REVERSAL: ${pos.asset} ${pos.market.timeframe} ${pos.side} — momentum flipped (ret=${metrics.returnFromOpen.toFixed(3)}%), P&L ${pnlPct.toFixed(1)}%`);
-        return {
-          conditionId: pos.conditionId,
-          rule: "momentum_reversal",
-          reason: `Momentum reversed (was ${entryWasBullish ? "bullish" : "bearish"}, now ${currentIsBullish ? "bullish" : "bearish"}, ret=${metrics.returnFromOpen.toFixed(3)}%) with P&L ${pnlPct.toFixed(1)}%`,
-          urgency: "high",
-          currentPrice: curPrice,
-        };
-      }
-    }
   }
 
   return null;

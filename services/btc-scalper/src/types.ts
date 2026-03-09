@@ -113,6 +113,34 @@ export interface CandleState {
   lastUpdateTime: number;    // Unix ms
 }
 
+// ─── Order Book Types ────────────────────────────────────────────────────────
+
+export interface OrderBookSnapshot {
+  exchange: "binance" | "bybit" | "okx";
+  symbol: string;
+  bids: [number, number][];  // [price, qty]
+  asks: [number, number][];
+  timestamp: number;
+}
+
+export interface AggregatedOBI {
+  obi: number;            // -1 to +1 volume-weighted bid/ask imbalance
+  bidVolume: number;      // total bid depth (USD) across exchanges
+  askVolume: number;      // total ask depth (USD)
+  exchangeCount: number;  // how many exchanges contributed
+  timestamp: number;
+}
+
+export const ASSET_BYBIT_SYMBOL: Record<Asset, string> = {
+  BTC: "BTCUSDT", ETH: "ETHUSDT", SOL: "SOLUSDT", DOGE: "DOGEUSDT",
+  SUI: "SUIUSDT", PEPE: "PEPEUSDT", LINK: "LINKUSDT", AVAX: "AVAXUSDT",
+};
+
+export const ASSET_OKX_SYMBOL: Record<Asset, string> = {
+  BTC: "BTC-USDT", ETH: "ETH-USDT", SOL: "SOL-USDT", DOGE: "DOGE-USDT",
+  SUI: "SUI-USDT", PEPE: "PEPE-USDT", LINK: "LINK-USDT", AVAX: "AVAX-USDT",
+};
+
 // ─── Signal Types ───────────────────────────────────────────────────────────
 
 export interface ScalpSignal {
@@ -144,6 +172,8 @@ export interface OpenPosition {
   tradeId: number;              // Journal trade ID
   peakPnlPct: number;           // High-water mark for trailing TP
   failedSellAttempts: number;   // Consecutive sell failures — force-remove after 3
+  tpOrderId?: string;       // GTC limit sell order ID (if useGtcTp enabled)
+  tpPrice?: number;         // Target TP price (entryPrice * (1 + gtcTpPct/100))
 }
 
 export interface ExitSignal {
@@ -154,10 +184,23 @@ export interface ExitSignal {
   currentPrice: number;         // Current Polymarket contract price
 }
 
+export interface PendingOrder {
+  orderId: string;
+  conditionId: string;
+  asset: Asset;
+  side: "Up" | "Down";
+  timeframe: Timeframe;
+  placedAt: number;
+  limitPrice: number;
+  amount: number;
+  cancelled: boolean;
+}
+
 // ─── Asset Pipeline ───────────────────────────────────────────────────────────
 
 import type { CandleTracker } from "./candle-tracker";
 import type { VolTracker } from "./vol-tracker";
+import type { TickCopulaTracker } from "./copula-tracker";
 
 export interface AssetPipeline {
   asset: Asset;
@@ -165,6 +208,8 @@ export interface AssetPipeline {
   volTracker: VolTracker;
   activeMarkets: CandleMarket[];
   prevGammaPrices: Map<string, number[]>;
+  obiFeed?: { readonly isReady: boolean; readonly lastObi: AggregatedOBI | null; connect(): void; destroy(): void };
+  copulaTracker?: TickCopulaTracker;
 }
 
 // ─── Health ─────────────────────────────────────────────────────────────────
@@ -218,7 +263,7 @@ export interface IPolymarketService {
     size: number;
     totalCost: number;
   }>;
-  sellPosition(conditionId: string, outcome: string): Promise<{
+  sellPosition(conditionId: string, outcome: string, knownSize?: number): Promise<{
     orderId: string;
     price: number;
   }>;

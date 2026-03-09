@@ -53,7 +53,7 @@ function randn(): number {
 }
 
 /** Normal CDF (Abramowitz & Stegun) */
-function normalCdf(x: number): number {
+export function normalCdf(x: number): number {
   const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
   const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
   const sign = x < 0 ? -1 : 1;
@@ -66,13 +66,22 @@ function normalCdf(x: number): number {
  * Student-t CDF approximation using the incomplete beta function relation.
  * For small ν (3-10), this provides adequate accuracy for copula thresholds.
  */
-function studentTCdf(x: number, nu: number): number {
+export function studentTCdf(x: number, nu: number): number {
   // Use normal CDF approximation adjusted for fat tails
   // Cornish-Fisher approximation: maps t to approximately normal
   const g1 = 1 / (4 * nu);
   const g2 = 1 / (2 * nu);
   const z = x * (1 - g1 * (x * x - 3) / 6 - g2);
   return normalCdf(z);
+}
+
+/**
+ * Compute the tail dependence coefficient for a t-copula.
+ * λ = 2 * t_{ν+1}(-√((ν+1)(1-ρ)/(1+ρ)))
+ */
+export function computeTailDependence(rho: number, nu: number): number {
+  const tdArg = -Math.sqrt((nu + 1) * (1 - rho) / (1 + rho));
+  return 2 * studentTCdf(tdArg, nu + 1);
 }
 
 /** Cholesky decomposition of a symmetric positive-definite matrix */

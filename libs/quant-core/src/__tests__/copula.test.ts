@@ -7,6 +7,9 @@ import {
   buildCorrelationMatrix,
   assessPortfolioRisk,
   calibrateCopulaDf,
+  normalCdf,
+  studentTCdf,
+  computeTailDependence,
 } from "../copula";
 
 describe("gaussianCopula", () => {
@@ -237,5 +240,45 @@ describe("calibrateCopulaDf", () => {
     const df = calibrateCopulaDf(series);
     expect(df).toBeGreaterThanOrEqual(2);
     expect(df).toBeLessThanOrEqual(30);
+  });
+});
+
+describe("studentTCdf", () => {
+  it("returns ~0.5 at x=0", () => {
+    expect(studentTCdf(0, 4)).toBeCloseTo(0.5, 2);
+  });
+
+  it("returns < 0.5 for negative x", () => {
+    expect(studentTCdf(-1, 4)).toBeLessThan(0.5);
+  });
+
+  it("returns > 0.5 for positive x", () => {
+    expect(studentTCdf(1, 4)).toBeGreaterThan(0.5);
+  });
+});
+
+describe("computeTailDependence", () => {
+  it("returns near-zero for rho=0 (uncorrelated)", () => {
+    const td = computeTailDependence(0, 4);
+    expect(td).toBeGreaterThanOrEqual(0);
+    expect(td).toBeLessThan(0.05);
+  });
+
+  it("returns positive value for rho=0.6, nu=4", () => {
+    const td = computeTailDependence(0.6, 4);
+    expect(td).toBeGreaterThan(0.05);
+    expect(td).toBeLessThan(1);
+  });
+
+  it("increases with higher correlation", () => {
+    const lowCorr = computeTailDependence(0.3, 4);
+    const highCorr = computeTailDependence(0.8, 4);
+    expect(highCorr).toBeGreaterThan(lowCorr);
+  });
+
+  it("decreases as nu increases (fat tails disappear)", () => {
+    const fatTail = computeTailDependence(0.6, 4);
+    const thinTail = computeTailDependence(0.6, 30);
+    expect(fatTail).toBeGreaterThan(thinTail);
   });
 });

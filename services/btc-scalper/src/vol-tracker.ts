@@ -2,6 +2,7 @@
 // Collects closed 1m klines from Binance and computes ATR(14) via quant-core.
 // Provides dynamic volScale per timeframe based on real-time BTC volatility.
 
+import axios from "axios";
 import { atrMetrics } from "quant-core";
 import type { PriceBar } from "quant-core/src/types";
 import type { BinanceKline, Timeframe } from "./types";
@@ -82,5 +83,49 @@ export class VolTracker {
 
     // Clamp to sane range
     return Math.max(0.05, Math.min(3.0, raw));
+  }
+
+  /**
+   * Seed the bar buffer from Binance REST API to eliminate warmup delay.
+   * Fetches the last 30 closed 1m klines. If the fetch fails, falls back
+   * to normal WS warmup (non-fatal).
+   */
+  async seedFromRest(symbol: string): Promise<void> {
+    try {
+      const url = `https://api.binance.com/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=1m&limit=${MAX_BARS}`;
+      const resp = await axios.get<any[][]>(url, { timeout: 10_000 });
+
+      // Binance kline response: [openTime, open, high, low, close, volume, closeTime, ...]
+      const bars: PriceBar[] = resp.data.map((k) => ({
+        timestamp: new Date(k[0] as number).toISOString(),
+        open: Number(k[1]),
+        high: Number(k[2]),
+        low: Number(k[3]),
+        close: Number(k[4]),
+        volume: Number(k[5]),
+        vwap: 0,
+      }));
+
+      this.bars = bars;
+
+      // Compute ATR immediately
+      if (this.bars.length >= MIN_BARS) {
+        const result = atrMetrics(this.bars);
+        if (result) {
+          this._atrPercent = result.atrPercent;
+          console.log(
+            `${LOG_PREFIX} Seeded from REST: atr=${result.atrPercent.toFixed(3)}% bars=${this.bars.length} (${symbol.toUpperCase()})`,
+          );
+          return;
+        }
+      }
+
+      console.warn(`${LOG_PREFIX} Seed fetched ${bars.length} bars but ATR calc failed — falling back to WS warmup`);
+    } catch (err) {
+      console.warn(
+        `${LOG_PREFIX} REST seed failed for ${symbol.toUpperCase()} (non-fatal, will warmup via WS):`,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
   }
 }

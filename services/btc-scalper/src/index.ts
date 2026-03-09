@@ -31,8 +31,10 @@ const origResolve = (Module as any)._resolveFilename;
 
 import { loadConfig } from "./config";
 import type { IPolymarketService, CandleMarket, Asset, AssetPipeline, AssetHealthStats } from "./types";
-import { ASSET_BINANCE_SYMBOL } from "./types";
+import { ASSET_BINANCE_SYMBOL, ASSET_BYBIT_SYMBOL, ASSET_OKX_SYMBOL } from "./types";
+import { OrderBookFeed } from "./orderbook-feed";
 import { BinanceFeed } from "./binance-feed";
+import { ClobFeed } from "./clob-feed";
 import { CandleTracker } from "./candle-tracker";
 import { MarketDiscovery } from "./market-discovery";
 import { evaluateSignals } from "./signal-engine";
@@ -41,6 +43,7 @@ import { Executor } from "./executor";
 import { Alerter } from "./alerter";
 import { HealthPinger } from "./health";
 import { VolTracker } from "./vol-tracker";
+import { TickCopulaTracker } from "./copula-tracker";
 import { getRealizedPnlToday, resolvePrediction } from "quant-core";
 
 const LOG_PREFIX = "[crypto-scalper]";
@@ -54,9 +57,13 @@ async function main(): Promise<void> {
   for (const [asset, ac] of config.assetConfigs) {
     console.log(`${LOG_PREFIX} ${asset}: maxBet=$${ac.maxBet}, timeframes=${ac.targetTimeframes.join(",")}, edge=${ac.minEdge}, momentum=${ac.minMomentumPct}%`);
   }
-  console.log(`${LOG_PREFIX} Exit: TP=${config.baseTakeProfitPct}% (decay=${config.tpDecayFactor}), SL=${config.baseStopLossPct}% (tighten=${config.slTightenFactor}), maxHold=${config.maxHoldElapsed}`);
+  console.log(`${LOG_PREFIX} Exit: TP=${config.baseTakeProfitPct}% (decay=${config.tpDecayFactor}), SL=${config.baseStopLossPct}% (tighten=${config.slTightenFactor}), maxHold=${config.maxHoldElapsed}, grace=${config.minHoldMs / 1000}s (5m=${config.minHoldMs5m / 1000}s)`);
   console.log(`${LOG_PREFIX} Trailing TP: activate=${config.trailingTpActivationPct}%, drop=${config.trailingTpDropPct}%`);
-  console.log(`${LOG_PREFIX} Limit orders: ${config.useLimitOrders ? `enabled (timeout=${config.limitOrderTimeoutMs}ms, poll=${config.limitOrderPollMs}ms)` : "disabled"}`);
+  console.log(`${LOG_PREFIX} Limit orders (buy): ${config.useLimitOrders ? `enabled (timeout=${config.limitOrderTimeoutMs}ms, poll=${config.limitOrderPollMs}ms)` : "disabled"}`);
+  console.log(`${LOG_PREFIX} Limit orders (sell): ${config.useLimitOrdersForExits ? `enabled (timeout=${config.sellLimitTimeoutMs}ms, poll=${config.sellLimitPollMs}ms)` : "disabled"}`);
+  if (config.useGtcTp) {
+    console.log(`${LOG_PREFIX} GTC TP: enabled (${config.gtcTpPct}%, poll=${config.gtcTpPollMs}ms)`);
+  }
   console.log(`${LOG_PREFIX} Telegram: ${config.telegramBotToken ? "configured" : "not configured"}`);
 
   // Create PolymarketService (runtime require to avoid compile-time dependency)
@@ -79,24 +86,43 @@ async function main(): Promise<void> {
       volTracker: new VolTracker(),
       activeMarkets: [],
       prevGammaPrices: new Map(),
+      obiFeed: config.enableObi ? new OrderBookFeed(
+        symbol,
+        ASSET_BYBIT_SYMBOL[asset],
+        ASSET_OKX_SYMBOL[asset],
+      ) : undefined,
+      copulaTracker: new TickCopulaTracker(),
     };
     pipelines.set(asset, pipeline);
     symbolToPipeline.set(symbol, pipeline);
     binanceSymbols.push(symbol);
   }
 
+  // Seed vol trackers from Binance REST API (eliminates 15min warmup)
+  await Promise.all(
+    config.assets.map((asset) => {
+      const symbol = ASSET_BINANCE_SYMBOL[asset];
+      const pipeline = pipelines.get(asset)!;
+      return pipeline.volTracker.seedFromRest(symbol);
+    }),
+  );
+
   // Create shared components
   const binance = new BinanceFeed(binanceSymbols);
+  // Connect WS directly (no proxy) — read-only data, geo-blocking only applies to order placement
+  const clobFeed = new ClobFeed();
   const discovery = new MarketDiscovery(config.gammaHost, config.assetConfigs, config.minLiquidity);
   const alerter = new Alerter(config);
   const health = new HealthPinger();
   const executor = new Executor(config, service, alerter, health);
 
-  // Wire Binance trades → per-asset pipeline trackers
+  // Wire Binance trades → per-asset pipeline trackers + copula
   binance.onTrade((trade, symbol) => {
     const pipeline = symbolToPipeline.get(symbol);
     if (pipeline) {
       pipeline.tracker.onTrade(trade);
+      const price = Number(trade.p);
+      if (price > 0) pipeline.copulaTracker?.onBtcTick(price);
     }
   });
 
@@ -108,8 +134,14 @@ async function main(): Promise<void> {
     }
   });
 
-  // Connect to Binance
+  // Connect to Binance + CLOB price feed
   binance.connect();
+  clobFeed.connect();
+
+  // Connect OBI feeds
+  for (const pipeline of pipelines.values()) {
+    pipeline.obiFeed?.connect();
+  }
 
   // Wait for first price on ALL configured assets (with 30s timeout)
   console.log(`${LOG_PREFIX} Waiting for Binance connection (${config.assets.join(", ")})...`);
@@ -153,12 +185,29 @@ async function main(): Promise<void> {
       const pipeline = pipelines.get(m.asset);
       if (pipeline) {
         pipeline.activeMarkets.push(m);
-        pipeline.tracker.addMarket(m);
+        pipeline.tracker.addMarket(m, ASSET_BINANCE_SYMBOL[m.asset]);
         if (m.outcomePrices.length >= 2) {
           pipeline.tracker.updateMarketPrices(m.conditionId, m.outcomePrices);
         }
       }
     }
+    // Sync CLOB WebSocket subscriptions to active market tokens
+    const allTokens: string[] = [];
+    for (const m of markets) {
+      allTokens.push(m.upTokenId, m.downTokenId);
+    }
+    clobFeed.setTokens(allTokens);
+  }
+
+  /** Get live contract price for a market+side, preferring CLOB WS over Gamma REST */
+  function getLivePrice(market: CandleMarket, side: "Up" | "Down"): number {
+    const tokenId = side === "Up" ? market.upTokenId : market.downTokenId;
+    const wsPrice = clobFeed.getPrice(tokenId);
+    if (wsPrice > 0 && clobFeed.getPriceAge(tokenId) < 30_000) {
+      return wsPrice;
+    }
+    // Fallback to Gamma REST prices
+    return side === "Up" ? market.outcomePrices[0] : market.outcomePrices[1];
   }
 
   // Initial market discovery
@@ -179,6 +228,26 @@ async function main(): Promise<void> {
   // Market discovery poll (30s)
   const marketPollInterval = setInterval(async () => {
     try {
+      // Force-exit positions whose candles have expired before pruning removes them
+      const now = Date.now();
+      for (const pos of executor.getOpenPositions()) {
+        const candleEndMs = new Date(pos.market.endDate).getTime();
+        if (now >= candleEndMs) {
+          const livePrice = polyPrices.get(pos.conditionId) ?? pos.entryPrice;
+          console.log(`${LOG_PREFIX} Force-exit expired candle: ${pos.asset} ${pos.market.timeframe} ${pos.side}`);
+          if (config.useGtcTp) {
+            await executor.cancelGtcTp(pos.conditionId);
+          }
+          await executor.executeSell({
+            conditionId: pos.conditionId,
+            rule: "time_decay",
+            reason: `Candle expired (endDate passed)`,
+            urgency: "high",
+            currentPrice: livePrice,
+          });
+        }
+      }
+
       allMarkets = await discovery.getActiveMarkets();
       distributeMarkets(allMarkets);
 
@@ -256,33 +325,28 @@ async function main(): Promise<void> {
 
     exitRunning = true;
     try {
-      // Update polyPrices for open positions from all pipeline market data
+      // Update polyPrices for open positions — prefer CLOB WS, fallback to Gamma REST
       for (const pos of openPositions) {
         const pipeline = pipelines.get(pos.asset);
         if (pipeline) {
           const market = pipeline.activeMarkets.find((m) => m.conditionId === pos.conditionId);
           if (market) {
-            const priceIdx = pos.side === "Up" ? 0 : 1;
-            polyPrices.set(pos.conditionId, market.outcomePrices[priceIdx] ?? pos.entryPrice);
+            polyPrices.set(pos.conditionId, getLivePrice(market, pos.side));
           }
         }
       }
 
-      let totalEquity = 0;
-      try {
-        const vitals = await service.getPortfolioValue();
-        totalEquity = vitals.totalEquity;
-        executor.updateCachedEquity(vitals.totalEquity, vitals.usdcBalance);
-      } catch {
-        totalEquity = openPositions.reduce((sum, p) => sum + p.amount, 0);
-      }
+      // Use cached equity (updated by signal loop) — zero HTTP calls per exit tick
+      const totalEquity = executor.getCachedTotalEquity() || openPositions.reduce((sum, p) => sum + p.amount, 0);
 
       const exitSignals = evaluateExits(openPositions, pipelines, config, totalEquity, polyPrices);
 
       const posSummary = openPositions.map((p) => {
         const curPrice = polyPrices.get(p.conditionId) ?? p.entryPrice;
         const pnlPct = ((curPrice - p.entryPrice) / p.entryPrice) * 100;
-        return `${p.asset}/${p.market.timeframe}/${p.side}=${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%`;
+        const tokenId = p.side === "Up" ? p.market.upTokenId : p.market.downTokenId;
+        const src = tokenId && clobFeed.getPrice(tokenId) > 0 && clobFeed.getPriceAge(tokenId) < 30_000 ? "ws" : "gam";
+        return `${p.asset}/${p.market.timeframe}/${p.side}=${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%(${src})`;
       }).join(", ");
       console.log(
         `${LOG_PREFIX} [exit-tick] positions=${openPositions.length} [${posSummary}] ` +
@@ -292,6 +356,11 @@ async function main(): Promise<void> {
       for (const signal of exitSignals) {
         await executor.executeSell(signal);
       }
+
+      // Poll GTC TP order fills
+      if (config.useGtcTp) {
+        await executor.pollGtcTpFills();
+      }
     } catch (err) {
       console.error(`${LOG_PREFIX} Exit eval failed:`, err instanceof Error ? err.message : String(err));
     } finally {
@@ -299,13 +368,39 @@ async function main(): Promise<void> {
     }
   }, exitMs);
 
+  // ─── Toxicity check (500ms) — cancel stale pending orders on momentum reversal
+  const toxicityInterval = setInterval(() => {
+    const pending = executor.getPendingOrders();
+    for (const order of pending) {
+      const pipeline = pipelines.get(order.asset);
+      if (!pipeline) continue;
+      const metrics = pipeline.tracker.getMetrics(order.conditionId);
+      if (!metrics) continue;
+      const reversed = (order.side === "Up" && metrics.returnFromOpen < 0)
+        || (order.side === "Down" && metrics.returnFromOpen > 0);
+      if (reversed) {
+        console.log(
+          `${LOG_PREFIX} [toxicity] Cancelling pending ${order.asset} ${order.timeframe} ${order.side} — ` +
+          `momentum reversed (ret=${metrics.returnFromOpen.toFixed(3)}%)`,
+        );
+        executor.requestCancelPending(order.conditionId);
+      }
+    }
+  }, 500);
+
   // ─── Post-exit immediate re-evaluation ─────────────────────────────
+  let signalRunning = false;
   executor.onExit = async (_conditionId, exitRule) => {
     if (exitRule === "circuit_breaker" || exitRule === "stop_loss") {
       console.log(`${LOG_PREFIX} [post-exit] Skipping re-eval after ${exitRule} exit`);
       return;
     }
 
+    if (signalRunning) {
+      console.log(`${LOG_PREFIX} [post-exit] Skipping re-eval — signal eval already running`);
+      return;
+    }
+    signalRunning = true;
     try {
       allMarkets = await discovery.getActiveMarkets(true);
       distributeMarkets(allMarkets);
@@ -322,30 +417,46 @@ async function main(): Promise<void> {
           assetConfig,
           pipeline.volTracker,
           pipeline.activeMarkets,
+          pipeline.obiFeed as any,
         );
         if (signals.length > 0) {
           console.log(`${LOG_PREFIX} [post-exit] ${asset} re-eval: ${signals.length} signal(s)`);
           for (const s of signals) {
-            await executor.executeBuy(s, pipeline.tracker);
+            await executor.executeBuy(s, pipeline.tracker, pipeline.copulaTracker);
           }
         }
       }
     } catch (err) {
       console.error(`${LOG_PREFIX} Post-exit re-eval failed:`, err instanceof Error ? err.message : String(err));
+    } finally {
+      signalRunning = false;
     }
   };
 
   // ─── Signal evaluation (5s) — buy checks ────────────────────────────
   const signalInterval = setInterval(async () => {
+    if (signalRunning) return;
+    signalRunning = true;
     try {
       // Refresh prices from Gamma before evaluating
       allMarkets = await discovery.getActiveMarkets();
       distributeMarkets(allMarkets);
 
-      // Update polyPrices from all pipelines
+      // Update polyPrices + market outcomePrices from CLOB WS (with Gamma REST fallback)
       for (const pipeline of pipelines.values()) {
         for (const m of pipeline.activeMarkets) {
-          polyPrices.set(m.conditionId, m.outcomePrices[0]);
+          // Inject live CLOB prices into market object so signal engine sees fresh data
+          const wsUp = clobFeed.getPrice(m.upTokenId);
+          const wsDown = clobFeed.getPrice(m.downTokenId);
+          if (wsUp > 0 && clobFeed.getPriceAge(m.upTokenId) < 30_000) m.outcomePrices[0] = wsUp;
+          if (wsDown > 0 && clobFeed.getPriceAge(m.downTokenId) < 30_000) m.outcomePrices[1] = wsDown;
+
+          // Use side-aware pricing for polyPrices map
+          const openPos = executor.getOpenPositions().find((p) => p.conditionId === m.conditionId);
+          const priceIdx = openPos?.side === "Down" ? 1 : 0;
+          polyPrices.set(m.conditionId, m.outcomePrices[priceIdx]);
+          // Feed copula tracker with Polymarket Up price
+          if (m.outcomePrices[0] > 0) pipeline.copulaTracker?.onPolyPriceUpdate(m.outcomePrices[0]);
         }
       }
 
@@ -402,16 +513,17 @@ async function main(): Promise<void> {
             assetConfig,
             pipeline.volTracker,
             pipeline.activeMarkets,
+            pipeline.obiFeed as any,
           );
           totalSignals += signals.length;
 
           const atrInfo = pipeline.volTracker.isReady
             ? `atr=${pipeline.volTracker.atrPercent?.toFixed(3)}%`
-            : `atr=warmup(${pipeline.volTracker.barCount}/8)`;
+            : `atr=warmup(${pipeline.volTracker.barCount}/15)`;
           assetParts.push(`${asset}=$${price.toLocaleString()} mkts=${pipeline.activeMarkets.length} ${atrInfo}`);
 
           for (const signal of signals) {
-            await executor.executeBuy(signal, pipeline.tracker);
+            await executor.executeBuy(signal, pipeline.tracker, pipeline.copulaTracker);
           }
         }
 
@@ -427,6 +539,8 @@ async function main(): Promise<void> {
       }
     } catch (err) {
       console.error(`${LOG_PREFIX} Signal eval failed:`, err instanceof Error ? err.message : String(err));
+    } finally {
+      signalRunning = false;
     }
   }, config.evalIntervalMs);
 
@@ -459,9 +573,14 @@ async function main(): Promise<void> {
     console.log(`${LOG_PREFIX} Shutting down...`);
     clearInterval(marketPollInterval);
     clearInterval(exitInterval);
+    clearInterval(toxicityInterval);
     clearInterval(signalInterval);
     clearInterval(healthInterval);
     binance.destroy();
+    clobFeed.destroy();
+    for (const pipeline of pipelines.values()) {
+      pipeline.obiFeed?.destroy();
+    }
     console.log(`${LOG_PREFIX} Shutdown complete.`);
     process.exit(0);
   };
@@ -473,6 +592,7 @@ async function main(): Promise<void> {
   console.log(
     `${LOG_PREFIX} Running. ${assetPrices}, ` +
     `markets=${allMarkets.length}, ` +
+    `CLOB WS=${clobFeed.isConnected ? "up" : "connecting"}, ` +
     `exit eval every ${exitMs / 1000}s, ` +
     `signal eval every ${config.evalIntervalMs / 1000}s, ` +
     `market poll every ${config.marketPollMs / 1000}s`,

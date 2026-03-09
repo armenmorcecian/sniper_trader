@@ -1,4 +1,7 @@
 import { Wallet } from "@ethersproject/wallet";
+import { JsonRpcProvider } from "@ethersproject/providers";
+import { Contract } from "@ethersproject/contracts";
+import { BigNumber } from "@ethersproject/bignumber";
 import {
   ClobClient,
   Chain,
@@ -37,20 +40,14 @@ export class PolymarketService {
   constructor(config: PolymarketConfig) {
     this.config = config;
 
-    const agentOpts = config.proxyUrl
-      ? { httpsAgent: new HttpsProxyAgent(config.proxyUrl), httpAgent: new HttpsProxyAgent(config.proxyUrl) }
-      : {};
-
     this.gammaApi = axios.create({
       baseURL: config.gammaHost,
       timeout: 15000,
-      ...agentOpts,
     });
 
     this.dataApi = axios.create({
       baseURL: config.dataHost,
       timeout: 15000,
-      ...agentOpts,
     });
 
     // API health interceptors — track consecutive failures for circuit breaker
@@ -244,7 +241,7 @@ export class PolymarketService {
       return originalPost(endpoint, options);
     };
 
-    console.log("[PolymarketService] Residential proxy enabled for GET + POST endpoints (with 403 retry)");
+    console.log("[PolymarketService] Residential proxy enabled for CLOB REST only — Gamma & Data APIs use direct connection");
   }
 
   /**
@@ -420,11 +417,13 @@ export class PolymarketService {
     }
 
     // Balance check (skip when caller already verified)
-    if (side === "BUY" && !params.skipBalanceChecks) {
-      const totalCost = amount * limitPrice;
-      const balance = await this.getUsdcBalance();
-      if (totalCost > balance) {
-        throw new InsufficientFundsError(totalCost, balance);
+    if (side === "BUY") {
+      if (!params.skipBalanceChecks) {
+        const totalCost = amount * limitPrice;
+        const balance = await this.getUsdcBalance();
+        if (totalCost > balance) {
+          throw new InsufficientFundsError(totalCost, balance);
+        }
       }
     } else {
       // SELL: verify we hold enough outcome tokens
@@ -496,10 +495,12 @@ export class PolymarketService {
     }
 
     // Balance check (skip when caller already verified)
-    if (side === "BUY" && !params.skipBalanceChecks) {
-      const balance = await this.getUsdcBalance();
-      if (amount > balance) {
-        throw new InsufficientFundsError(amount, balance);
+    if (side === "BUY") {
+      if (!params.skipBalanceChecks) {
+        const balance = await this.getUsdcBalance();
+        if (amount > balance) {
+          throw new InsufficientFundsError(amount, balance);
+        }
       }
     } else {
       // SELL: verify we hold enough outcome tokens
@@ -524,16 +525,91 @@ export class PolymarketService {
       ),
     );
 
+    // Compute actual fill price from CLOB response amounts
+    // BUY:  makingAmount = USDC spent, takingAmount = tokens received
+    // SELL: makingAmount = tokens sold, takingAmount = USDC received
+    const taking = Number(orderResponse.takingAmount) || 0;
+    const making = Number(orderResponse.makingAmount) || 0;
+    const fillPrice = side === "BUY"
+      ? (taking > 0 ? making / taking : 0)   // USDC spent / tokens received
+      : (making > 0 ? taking / making : 0);  // USDC received / tokens sold
+
+    console.log(
+      `[polymarket] marketBuy ${side}: making=${making} taking=${taking} → fillPrice=${fillPrice.toFixed(6)}`,
+    );
+
     const balanceAfter = params.skipBalanceChecks ? 0 : await this.getUsdcBalance();
 
     return {
       orderId: orderResponse.orderID || "",
       side: side as "BUY" | "SELL",
       outcome,
-      price: 0, // Market order — filled at best available
-      size: amount,
-      totalCost: amount,
+      price: fillPrice,
+      size: side === "BUY"
+        ? (taking > 0 ? taking : amount)
+        : (making > 0 ? making : amount),
+      totalCost: side === "BUY"
+        ? (making > 0 ? making : amount)
+        : (taking > 0 ? taking : amount),
       balanceAfter,
+      status: orderResponse.status || "unknown",
+      transactionHashes: orderResponse.transactionsHashes || [],
+    };
+  }
+
+  /**
+   * Fast-path market buy: skips Gamma fetch and whale detection.
+   * Takes tokenId directly (already resolved by caller) and only does
+   * getTickSize + getNegRisk + FOK order.
+   */
+  async fastMarketBuy(params: {
+    tokenId: string;
+    amount: number;
+    side: "BUY" | "SELL";
+  }): Promise<TradeResult> {
+    await this.ensureInitialized();
+
+    const { tokenId, amount, side } = params;
+
+    const [tickSize, negRisk] = await Promise.all([
+      withRetry(() => this.clobClient.getTickSize(tokenId)),
+      withRetry(() => this.clobClient.getNegRisk(tokenId)),
+    ]);
+
+    const orderResponse = await withRetry(() =>
+      this.clobClient.createAndPostMarketOrder(
+        {
+          tokenID: tokenId,
+          amount,
+          side: side === "BUY" ? Side.BUY : Side.SELL,
+        },
+        { tickSize, negRisk },
+        OrderType.FOK,
+      ),
+    );
+
+    const taking = Number(orderResponse.takingAmount) || 0;
+    const making = Number(orderResponse.makingAmount) || 0;
+    const fillPrice = side === "BUY"
+      ? (taking > 0 ? making / taking : 0)
+      : (making > 0 ? taking / making : 0);
+
+    console.log(
+      `[polymarket] fastMarketBuy ${side}: making=${making} taking=${taking} → fillPrice=${fillPrice.toFixed(6)}`,
+    );
+
+    return {
+      orderId: orderResponse.orderID || "",
+      side: side as "BUY" | "SELL",
+      outcome: "",
+      price: fillPrice,
+      size: side === "BUY"
+        ? (taking > 0 ? taking : amount)
+        : (making > 0 ? making : amount),
+      totalCost: side === "BUY"
+        ? (making > 0 ? making : amount)
+        : (taking > 0 ? taking : amount),
+      balanceAfter: 0,
       status: orderResponse.status || "unknown",
       transactionHashes: orderResponse.transactionsHashes || [],
     };
@@ -711,6 +787,7 @@ export class PolymarketService {
   async sellPosition(
     conditionId: string,
     outcome: string,
+    knownSize?: number,
   ): Promise<TradeResult> {
     await this.ensureInitialized();
     const marketData = await this.fetchGammaMarket(conditionId);
@@ -720,25 +797,32 @@ export class PolymarketService {
       outcome,
     );
 
-    // Get current position size
-    const positions = await this.getOpenPositionsWithPnL();
-    const position = positions.find(
-      (p) =>
-        p.conditionId === conditionId &&
-        p.outcome.toLowerCase() === outcome.toLowerCase(),
-    );
-
-    if (!position || position.size <= 0) {
-      throw new Error(
-        `No open position found for ${conditionId} ${outcome}`,
+    let size: number;
+    if (knownSize && knownSize > 0) {
+      // Caller provided size — skip expensive Data API lookup (4 HTTP calls)
+      size = knownSize;
+    } else {
+      // Fallback: query Data API for position size (backward compatibility)
+      const positions = await this.getOpenPositionsWithPnL();
+      const position = positions.find(
+        (p) =>
+          p.conditionId === conditionId &&
+          p.outcome.toLowerCase() === outcome.toLowerCase(),
       );
+
+      if (!position || position.size <= 0) {
+        throw new Error(
+          `No open position found for ${conditionId} ${outcome}`,
+        );
+      }
+      size = position.size;
     }
 
     return this.marketBuy({
       marketConditionId: conditionId,
       outcome,
       side: "SELL",
-      amount: position.size,
+      amount: size,
     });
   }
 
@@ -810,6 +894,102 @@ export class PolymarketService {
       const resp = await this.gammaApi.get("/markets", { params: { condition_id: conditionId } });
       return resp.data?.[0]?.endDate || resp.data?.[0]?.end_date_iso || null;
     } catch { return null; }
+  }
+
+  // ─── On-Chain Redemption ────────────────────────────────────────────────
+
+  /**
+   * Redeems winning conditional tokens via Polymarket's gasless relayer.
+   * No MATIC needed — Polymarket sponsors the gas.
+   * Safe to call multiple times — re-redeeming is a no-op.
+   */
+  async redeemWinningTokens(conditionId: string): Promise<boolean> {
+    if (!this.config.builderApiKey || !this.config.builderSecret || !this.config.builderPassphrase) {
+      console.warn("[polymarket] redeemWinningTokens: Builder API credentials not configured — skipping");
+      return false;
+    }
+
+    const CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+    const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+    const PARENT_COLLECTION = "0x0000000000000000000000000000000000000000000000000000000000000000";
+    const RELAYER_URL = "https://relayer-v2.polymarket.com/";
+
+    const CTF_ABI = ["function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)"];
+
+    try {
+      const { RelayClient, RelayerTxType, RelayerTransactionState } = require("@polymarket/builder-relayer-client");
+      const { BuilderConfig } = require("@polymarket/builder-signing-sdk");
+
+      // Relayer needs a signer; connect to Polygon RPC if available, otherwise use default
+      const provider = this.config.polygonRpc
+        ? new JsonRpcProvider(this.config.polygonRpc)
+        : new JsonRpcProvider("https://polygon-rpc.com");
+      const wallet = new Wallet(this.config.privateKey, provider);
+
+      const builderConfig = new BuilderConfig({
+        localBuilderCreds: {
+          key: this.config.builderApiKey,
+          secret: this.config.builderSecret,
+          passphrase: this.config.builderPassphrase,
+        },
+      });
+
+      const relayClient = new RelayClient(
+        RELAYER_URL,
+        137, // Polygon
+        wallet,
+        builderConfig,
+        RelayerTxType.PROXY,
+      );
+
+      // Encode the CTF redeemPositions call
+      const ctf = new Contract(CTF_ADDRESS, CTF_ABI, wallet);
+      const redeemData = ctf.interface.encodeFunctionData("redeemPositions", [
+        USDC_ADDRESS,
+        PARENT_COLLECTION,
+        conditionId,
+        [1, 2], // Both outcome index sets
+      ]);
+
+      console.log(`[polymarket] Submitting gasless redemption via relayer for ${conditionId.slice(0, 12)}...`);
+
+      const response = await relayClient.execute(
+        [{ to: CTF_ADDRESS, data: redeemData, value: "0" }],
+        `penny-collector:redeem:${conditionId.slice(0, 12)}`,
+      );
+
+      console.log(`[polymarket] Relayer tx submitted: id=${response.transactionID} state=${response.state}`);
+
+      // Relayer accepted — trust it to settle on-chain
+      // STATE_EXECUTED means the relayer will submit the tx; no need to block waiting for mining
+      if (response.state === "STATE_NEW" || response.state === "STATE_EXECUTED") {
+        console.log(`[polymarket] Redemption accepted by relayer (will settle on-chain): ${response.transactionID}`);
+        return true;
+      }
+
+      // If immediate failure, poll briefly to confirm
+      const result = await relayClient.pollUntilState(
+        response.transactionID,
+        [RelayerTransactionState.STATE_CONFIRMED, RelayerTransactionState.STATE_MINED, "STATE_EXECUTED"],
+        RelayerTransactionState.STATE_FAILED,
+        10, // maxPolls
+        3000, // pollFrequency ms
+      );
+
+      if (result) {
+        console.log(`[polymarket] Redemption confirmed: txHash=${result.transactionHash} state=${result.state}`);
+        return true;
+      } else {
+        console.warn(`[polymarket] Redemption failed for ${conditionId.slice(0, 12)}`);
+        return false;
+      }
+    } catch (err) {
+      console.error(
+        "[polymarket] redeemWinningTokens error:",
+        err instanceof Error ? err.message : String(err),
+      );
+      return false;
+    }
   }
 
   // ─── Private Helpers ──────────────────────────────────────────────────────

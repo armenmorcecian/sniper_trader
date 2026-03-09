@@ -2,10 +2,48 @@
 // Real-time candle state machine. Tracks BTC price action per active Polymarket
 // candle market: open price, VWAP, order flow, elapsed time.
 
+import axios from "axios";
 import type { BinanceTrade, CandleMarket, CandleState } from "./types";
 import { TIMEFRAME_SECONDS } from "./types";
 
 const LOG_PREFIX = "[candle-tracker]";
+
+// Cache: "BTCUSDT:1709856000000" → Promise<openPrice>
+const klineCache = new Map<string, Promise<number>>();
+
+async function fetchKlineOpen(symbol: string, startDateIso: string): Promise<number> {
+  const startMs = new Date(startDateIso).getTime();
+  if (isNaN(startMs) || startMs <= 0) return 0;
+
+  const roundedMs = Math.floor(startMs / 60_000) * 60_000;
+  const cacheKey = `${symbol.toUpperCase()}:${roundedMs}`;
+
+  const existing = klineCache.get(cacheKey);
+  if (existing) return existing;
+
+  // Evict oldest if cache grows large
+  if (klineCache.size >= 200) {
+    const firstKey = klineCache.keys().next().value;
+    if (firstKey) klineCache.delete(firstKey);
+  }
+
+  const promise = (async () => {
+    try {
+      const url = `https://api.binance.com/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=1m&startTime=${roundedMs}&limit=1`;
+      const resp = await axios.get<any[][]>(url, { timeout: 5_000 });
+      if (resp.data?.length > 0) {
+        const open = Number(resp.data[0][1]);
+        if (!isNaN(open) && open > 0) return open;
+      }
+      return 0;
+    } catch {
+      return 0;
+    }
+  })();
+
+  klineCache.set(cacheKey, promise);
+  return promise;
+}
 
 export class CandleTracker {
   private candles = new Map<string, CandleState>();
@@ -15,7 +53,7 @@ export class CandleTracker {
   get activeCount(): number { return this.candles.size; }
 
   /** Register a new candle market to track */
-  addMarket(market: CandleMarket): void {
+  addMarket(market: CandleMarket, binanceSymbol?: string): void {
     if (this.candles.has(market.conditionId)) return;
 
     const now = Date.now();
@@ -35,6 +73,21 @@ export class CandleTracker {
       startTime: now,
       lastUpdateTime: now,
     });
+
+    // Async-correct openPrice from Binance kline at actual candle start
+    if (binanceSymbol && market.startDate) {
+      fetchKlineOpen(binanceSymbol, market.startDate).then(realOpen => {
+        if (realOpen <= 0) return;
+        const candle = this.candles.get(market.conditionId);
+        if (!candle) return;
+        const old = candle.openPrice;
+        candle.openPrice = realOpen;
+        console.log(
+          `${LOG_PREFIX} Corrected openPrice for ${market.conditionId.slice(0, 8)}: ` +
+          `$${old.toFixed(2)} → $${realOpen.toFixed(2)} (candle start: ${market.startDate})`,
+        );
+      }).catch(() => {});
+    }
   }
 
   /** Remove a candle market (expired or no longer active) */
