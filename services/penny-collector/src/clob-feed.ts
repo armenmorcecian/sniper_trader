@@ -85,7 +85,9 @@ export class ClobFeed {
     this.subscribedTokens = newSet;
 
     if (toAdd.length > 0 && this.ws?.readyState === WebSocket.OPEN) {
-      this.subscribe(toAdd);
+      // Re-subscribe with FULL token set so the WS sends book snapshots for new tokens.
+      // Sending only new tokens doesn't trigger snapshots on the Polymarket CLOB WS.
+      this.subscribe([...newSet]);
     } else if (toAdd.length > 0) {
       for (const id of toAdd) this.pendingTokens.add(id);
     }
