@@ -95,7 +95,7 @@ export class MarketDiscovery {
         order: "endDate",
         ascending: true,
       },
-      timeout: 15_000,
+      timeout: 5_000,
     });
 
     const events: Record<string, unknown>[] = resp.data || [];

@@ -124,6 +124,25 @@ export class PennyExecutor {
         return false;
       }
 
+      if (fillPrice > this.config.maxWinningPrice) {
+        console.warn(
+          `${LOG_PREFIX} SLIPPAGE REJECT (max): fill $${fillPrice.toFixed(3)} > max $${this.config.maxWinningPrice} — ` +
+          `selling back ${candidate.market.asset} ${candidate.market.timeframe} ${candidate.winningSide}`,
+        );
+        try {
+          const shares = result.totalCost / fillPrice;
+          await this.service.fastMarketBuy({
+            tokenId: candidate.tokenId,
+            amount: shares,
+            side: "SELL",
+          });
+        } catch (err) {
+          console.error(`${LOG_PREFIX} Slippage sell-back failed:`, err instanceof Error ? err.message : String(err));
+        }
+        // Keep betConditionIds locked — never re-buy a market we already filled on
+        return false;
+      }
+
       // Record in journal
       let tradeId = 0;
       try {
