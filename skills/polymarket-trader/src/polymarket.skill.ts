@@ -14,7 +14,7 @@ import {
   recordTrade, queryTrades, getDailySummary, getTradesToday, recordEquitySnapshot,
   PredictionMarketParticleFilter, getCalibrationMetrics,
   buildCorrelationMatrix, assessPortfolioRisk, calibrateCopulaDf,
-  getPerformanceMetrics,
+  getPerformanceMetrics, getDb,
 } from "quant-core";
 import type { TradeEntry } from "quant-core";
 
@@ -214,6 +214,33 @@ function normalizeParams<T extends Record<string, unknown>>(params: T): T {
   }
 
   return p as T;
+}
+
+// ─── Penny-Collector Position Filter ────────────────────────────────────────
+// The penny-collector service buys near-expiry positions and holds to resolution
+// at $1.00. The agent's manage_open_positions must NOT sell these — doing so
+// destroys the hold-to-resolution strategy and causes massive losses.
+
+/**
+ * Returns a Set of conditionIds that belong to the penny-collector service.
+ * Queries the trade journal for any BUY recorded with tool = "penny-collector:buy".
+ */
+function getPennyCollectorConditionIds(): Set<string> {
+  try {
+    const { db, pooled } = getDb();
+    try {
+      const rows = db.prepare(`
+        SELECT DISTINCT condition_id FROM trades
+        WHERE tool = 'penny-collector:buy' AND condition_id IS NOT NULL
+      `).all() as { condition_id: string }[];
+      return new Set(rows.map(r => r.condition_id));
+    } finally {
+      if (!pooled) db.close();
+    }
+  } catch {
+    // If DB is unavailable, return empty set — fail open (don't block position management)
+    return new Set();
+  }
 }
 
 // ─── Tool Definitions ───────────────────────────────────────────────────────
@@ -417,7 +444,24 @@ export const tools = [
         const service = getPolymarketService();
         const positions = await service.getOpenPositionsWithPnL();
         const stopLossPercent = params.stopLossPercent ?? -15;
-        const flagged = checkStopLoss(positions, stopLossPercent);
+
+        // ── Skip penny-collector positions ──────────────────────────────────
+        // The penny-collector service buys near-expiry candle markets and
+        // holds to resolution at $1.00. These positions intentionally have
+        // hoursToExpiration ≈ 0 and must NOT be sold by the agent.
+        const pennyConditionIds = getPennyCollectorConditionIds();
+        const managedPositions = positions.filter(pos => {
+          if (pennyConditionIds.has(pos.conditionId)) {
+            console.log(
+              `[manage_open_positions] Skipping penny-collector position: ${pos.conditionId.slice(0, 12)}… (${pos.question || "unknown"})`,
+            );
+            return false;
+          }
+          return true;
+        });
+        const skippedCount = positions.length - managedPositions.length;
+
+        const flagged = checkStopLoss(managedPositions, stopLossPercent);
 
         // Record flagged positions to journal
         for (const pos of flagged) {
@@ -437,7 +481,7 @@ export const tools = [
 
         // Enrich positions with expiration data
         const enrichedPositions = await Promise.all(
-          positions.map(async (pos) => {
+          managedPositions.map(async (pos) => {
             try {
               const endDate = await service.getMarketEndDate(pos.conditionId);
               if (!endDate) return pos;
@@ -482,6 +526,7 @@ export const tools = [
           flaggedForExit: flagged,
           stopLossThreshold: stopLossPercent,
           actionRequired: flagged.length > 0,
+          pennyCollectorSkipped: skippedCount,
         };
       } catch (err) {
         return formatAxiosError(err, "manage_open_positions");
