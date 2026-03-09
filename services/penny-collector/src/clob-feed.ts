@@ -34,6 +34,8 @@ export class ClobFeed {
   private _changeEventCount = 0;
   private _tradeEventCount = 0;
   private _droppedCount = 0;
+  private _lastMessageTime = 0;
+  private _lastPongTime = 0;
   private _proxyUrl: string | undefined;
   private bookBids = new Map<string, Map<string, number>>();  // tokenId → (price_str → size)
   private bookAsks = new Map<string, Map<string, number>>();  // tokenId → (price_str → size)
@@ -194,6 +196,8 @@ export class ClobFeed {
       this.reconnectDelay = 1000;
       this._messageCount = 0;
       this._rawLogCount = 0;
+      this._lastMessageTime = Date.now();
+      this._lastPongTime = Date.now();
 
       // Subscribe to all tracked tokens
       const allTokens = [...this.subscribedTokens, ...this.pendingTokens];
@@ -202,18 +206,44 @@ export class ClobFeed {
         this.subscribe(allTokens);
       }
 
-      // Keepalive ping
+      // Keepalive ping + zombie detection
       if (this.pingInterval) clearInterval(this.pingInterval);
       this.pingInterval = setInterval(() => {
         if (this.ws?.readyState === WebSocket.OPEN) {
           this.ws.ping();
+
+          const now = Date.now();
+
+          // Zombie check 1: subscribed but no data for 60s
+          if (this.subscribedTokens.size > 0 && now - this._lastMessageTime > 60_000) {
+            console.warn(
+              `${LOG_PREFIX} Zombie detected: no messages for ${Math.round((now - this._lastMessageTime) / 1000)}s ` +
+              `with ${this.subscribedTokens.size} subscribed tokens — force reconnecting`,
+            );
+            this.ws!.terminate();
+            return;
+          }
+
+          // Zombie check 2: no pong response for 2x ping interval
+          if (now - this._lastPongTime > 2 * PING_INTERVAL_MS) {
+            console.warn(
+              `${LOG_PREFIX} Zombie detected: no pong for ${Math.round((now - this._lastPongTime) / 1000)}s — force reconnecting`,
+            );
+            this.ws!.terminate();
+            return;
+          }
         }
       }, PING_INTERVAL_MS);
+    });
+
+    this.ws.on("pong", () => {
+      this._lastPongTime = Date.now();
     });
 
     this.ws.on("message", (data: WebSocket.Data) => {
       this._messageCount++;
       const now = Date.now();
+      this._lastMessageTime = now;
 
       // Log first 10 raw messages after each (re)connect for diagnostics
       if (this._rawLogCount < 10) {
