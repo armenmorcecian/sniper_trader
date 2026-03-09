@@ -100,16 +100,17 @@ export class PennyExecutor {
         return false;
       }
 
-      // Post-fill price guard: reject if slippage pushed fill price below threshold
+      // Post-fill price guard: reject if slippage pushed fill price above max threshold
+      // (lower fills are fine — cheaper entry = more profit when contract resolves at $1)
       // NOTE: Do NOT clear betConditionIds here — the order DID fill, so we must
       // keep the dedup lock to prevent double-buying on the next scan cycle.
       const fillPrice = result.price > 0 ? result.price : candidate.winningPrice;
-      if (fillPrice < this.config.minWinningPrice) {
+
+      if (fillPrice > this.config.maxWinningPrice) {
         console.warn(
-          `${LOG_PREFIX} SLIPPAGE REJECT: fill $${fillPrice.toFixed(3)} < min $${this.config.minWinningPrice} — ` +
+          `${LOG_PREFIX} SLIPPAGE REJECT (max): fill $${fillPrice.toFixed(3)} > max $${this.config.maxWinningPrice} — ` +
           `selling back ${candidate.market.asset} ${candidate.market.timeframe} ${candidate.winningSide}`,
         );
-        // Sell back immediately to cut the bad fill
         try {
           const shares = result.totalCost / fillPrice;
           await this.service.fastMarketBuy({
