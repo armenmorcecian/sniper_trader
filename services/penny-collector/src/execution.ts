@@ -183,6 +183,12 @@ export class PennyExecutor {
   async checkStopLosses(clobFeed: ClobFeed): Promise<void> {
     for (const [conditionId, pos] of this.positions) {
       if (pos.status !== "open") continue;
+      if (pos.stopLossAttempted) continue;
+
+      // Don't stop-loss near expiry — CLOB prices are unreliable as MMs pull liquidity.
+      // Let checkResolutions() handle these positions after the settlement buffer.
+      const endMs = new Date(pos.market.endDate).getTime();
+      if (Date.now() >= endMs - 60_000) continue;
 
       const currentPrice = clobFeed.getPrice(pos.tokenId);
       if (currentPrice <= 0) continue; // no price data yet
@@ -223,6 +229,7 @@ export class PennyExecutor {
         pos.status = "sold";
       } catch (err) {
         console.error(`${LOG_PREFIX} Stop-loss sell failed:`, err instanceof Error ? err.message : String(err));
+        pos.stopLossAttempted = true;
       }
     }
   }
@@ -230,7 +237,7 @@ export class PennyExecutor {
   /** Check if held positions have resolved (candle expired + settlement buffer) */
   async checkResolutions(): Promise<void> {
     const now = Date.now();
-    const SETTLE_BUFFER_MS = 30_000; // 30s after expiry
+    const SETTLE_BUFFER_MS = 600_000; // 10min — oracle needs time to resolve
 
     for (const [conditionId, pos] of this.positions) {
       // Already sold by stop-loss — just clean up
@@ -243,7 +250,12 @@ export class PennyExecutor {
       const endMs = new Date(pos.market.endDate).getTime();
       if (now <= endMs + SETTLE_BUFFER_MS) continue;
 
-      // Check actual resolution
+      // Check actual resolution.
+      // IMPORTANT: We must wait for the on-chain oracle to resolve before trusting
+      // wallet balance. At 30s post-expiry, tokens are ALWAYS still held because
+      // the oracle hasn't reported yet — leading to false wins. At 10min the oracle
+      // has almost always resolved, so "tokens still held = win, tokens gone = loss"
+      // is reliable.
       let exitPrice: number;
       try {
         const vitals = await this.service.getPortfolioValue();
@@ -251,8 +263,35 @@ export class PennyExecutor {
           (p) => p.conditionId === conditionId && p.size > 0,
         );
         if (stillHeld) {
-          // Tokens still in wallet = won, will be redeemed at $1.00
-          exitPrice = 1.00;
+          // Tokens still in wallet — attempt redemption to confirm oracle resolved.
+          // If redemption fails with "result for condition not received yet", the
+          // oracle hasn't resolved — skip and retry next cycle.
+          if (this.service.redeemWinningTokens) {
+            try {
+              const redeemed = await this.service.redeemWinningTokens(conditionId);
+              if (redeemed) {
+                console.log(`${LOG_PREFIX} Redeemed winning tokens for ${conditionId.slice(0, 12)}`);
+                exitPrice = 1.00;
+              } else {
+                // Redemption returned false — oracle may not have resolved yet
+                console.log(`${LOG_PREFIX} Redemption not ready for ${conditionId.slice(0, 12)} — will retry next cycle`);
+                continue;
+              }
+            } catch (redeemErr: unknown) {
+              const msg = redeemErr instanceof Error ? redeemErr.message : String(redeemErr);
+              if (msg.includes("not received yet") || msg.includes("not resolved")) {
+                // Oracle hasn't resolved — don't assume win, retry next cycle
+                console.log(`${LOG_PREFIX} Oracle not resolved for ${conditionId.slice(0, 12)} — will retry next cycle`);
+                continue;
+              }
+              // Other redemption error (network, proxy, etc.) — still a win, just
+              // couldn't redeem yet. Log and record the win; redemption can happen later.
+              console.warn(`${LOG_PREFIX} Redemption failed for ${conditionId.slice(0, 12)} (non-fatal): ${msg}`);
+              exitPrice = 1.00;
+            }
+          } else {
+            exitPrice = 1.00;
+          }
         } else {
           // Tokens gone — check if journal already has an exit (another service may have sold)
           if (pos.tradeId) {
@@ -270,26 +309,9 @@ export class PennyExecutor {
           exitPrice = 0.00;
         }
       } catch {
-        // Fallback: assume win (conservative — avoids false loss on API error)
-        exitPrice = 1.00;
-        console.warn(`${LOG_PREFIX} Could not verify resolution for ${conditionId.slice(0, 12)} — assuming win`);
-      }
-
-      // Fire-and-forget redemption — don't block scan loop on slow proxy calls
-      if (exitPrice === 1.00 && this.service.redeemWinningTokens) {
-        console.log(`${LOG_PREFIX} Attempting redemption for ${conditionId.slice(0, 12)}...`);
-        this.service.redeemWinningTokens(conditionId).then(
-          (redeemed) => {
-            if (redeemed) {
-              console.log(`${LOG_PREFIX} Redeemed winning tokens for ${conditionId.slice(0, 12)}`);
-            } else {
-              console.warn(`${LOG_PREFIX} Redemption returned false for ${conditionId.slice(0, 12)}`);
-            }
-          },
-          (err: unknown) => {
-            console.error(`${LOG_PREFIX} Redemption failed (non-fatal):`, err instanceof Error ? err.message : String(err));
-          },
-        );
+        // API error — don't assume anything, retry next cycle
+        console.warn(`${LOG_PREFIX} Could not verify resolution for ${conditionId.slice(0, 12)} — will retry next cycle`);
+        continue;
       }
 
       const shares = pos.amount / pos.entryPrice;
