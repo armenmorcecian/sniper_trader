@@ -275,19 +275,21 @@ export class PennyExecutor {
         console.warn(`${LOG_PREFIX} Could not verify resolution for ${conditionId.slice(0, 12)} — assuming win`);
       }
 
-      // Redeem winning tokens on-chain to unlock USDC
+      // Fire-and-forget redemption — don't block scan loop on slow proxy calls
       if (exitPrice === 1.00 && this.service.redeemWinningTokens) {
         console.log(`${LOG_PREFIX} Attempting redemption for ${conditionId.slice(0, 12)}...`);
-        try {
-          const redeemed = await this.service.redeemWinningTokens(conditionId);
-          if (redeemed) {
-            console.log(`${LOG_PREFIX} Redeemed winning tokens for ${conditionId.slice(0, 12)}`);
-          } else {
-            console.warn(`${LOG_PREFIX} Redemption returned false for ${conditionId.slice(0, 12)}`);
-          }
-        } catch (err) {
-          console.error(`${LOG_PREFIX} Redemption failed (non-fatal):`, err instanceof Error ? err.message : String(err));
-        }
+        this.service.redeemWinningTokens(conditionId).then(
+          (redeemed) => {
+            if (redeemed) {
+              console.log(`${LOG_PREFIX} Redeemed winning tokens for ${conditionId.slice(0, 12)}`);
+            } else {
+              console.warn(`${LOG_PREFIX} Redemption returned false for ${conditionId.slice(0, 12)}`);
+            }
+          },
+          (err: unknown) => {
+            console.error(`${LOG_PREFIX} Redemption failed (non-fatal):`, err instanceof Error ? err.message : String(err));
+          },
+        );
       }
 
       const shares = pos.amount / pos.entryPrice;
@@ -306,17 +308,19 @@ export class PennyExecutor {
         if (pos.tradeId) updateTradeExit(pos.tradeId, exitPrice, pnl);
       } catch { /* non-fatal */ }
 
-      // Equity snapshot
-      try {
-        const vitals = await this.service.getPortfolioValue();
-        recordEquitySnapshot({
-          skill: "polymarket",
-          equity: vitals.totalEquity,
-          cash: vitals.usdcBalance,
-          positionsValue: vitals.positionValue,
-          metadata: { source: "penny-collector", asset: pos.market.asset, exitRule: "resolution" },
-        });
-      } catch { /* non-fatal */ }
+      // Fire-and-forget equity snapshot — don't block scan loop
+      this.service.getPortfolioValue().then(
+        (vitals) => {
+          recordEquitySnapshot({
+            skill: "polymarket",
+            equity: vitals.totalEquity,
+            cash: vitals.usdcBalance,
+            positionsValue: vitals.positionValue,
+            metadata: { source: "penny-collector", asset: pos.market.asset, exitRule: "resolution" },
+          });
+        },
+        () => { /* non-fatal */ },
+      );
 
       this.positions.delete(conditionId);
       this.betConditionIds.delete(conditionId);
