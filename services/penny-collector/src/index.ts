@@ -38,6 +38,26 @@ const LOG_PREFIX = "[penny-collector]";
 async function main(): Promise<void> {
   console.log(`${LOG_PREFIX} Starting penny collector service...`);
 
+  // ─── Early health stamp ───────────────────────────────────────────────
+  // Write a health ping immediately at process start — before any slow async
+  // work (PolymarketService constructor, Polygon RPC calls, etc.) — so the
+  // Docker healthcheck doesn't kill the container during initialization.
+  // The regular writeHealth() interval will overwrite this with full status.
+  const healthFileEarly = path.join(
+    process.env.HOME || process.env.USERPROFILE || "/home/node",
+    ".openclaw",
+    "signals",
+    "penny-collector-meta.json",
+  );
+  try {
+    const earlyDir = path.dirname(healthFileEarly);
+    if (!fs.existsSync(earlyDir)) fs.mkdirSync(earlyDir, { recursive: true });
+    const earlyTmp = healthFileEarly + ".tmp";
+    fs.writeFileSync(earlyTmp, JSON.stringify({ lastPing: new Date().toISOString(), openPositions: 0, assets: ["BTC"], starting: true }, null, 2));
+    fs.renameSync(earlyTmp, healthFileEarly);
+    console.log(`${LOG_PREFIX} Health file stamped (early startup ping)`);
+  } catch { /* non-fatal — full writeHealth() will retry */ }
+
   const config = loadConfig();
   console.log(`${LOG_PREFIX} Assets: ${config.assets.join(", ")}`);
   console.log(`${LOG_PREFIX} Window: ${config.minSecondsBeforeExpiry}-${config.maxSecondsBeforeExpiry}s before expiry`);
@@ -59,6 +79,40 @@ async function main(): Promise<void> {
 
   const scanner = new ExpiryScanner(discovery, config, clobFeed);
   const executor = new PennyExecutor(config, service);
+
+  // ─── Health ping (2min) ───────────────────────────────────────────────
+  // Write the health file BEFORE executor.init() so the Docker healthcheck
+  // doesn't kill the container while init is blocked on slow Polygon RPC calls
+  // (e.g. redeemOrphanedWinners gas estimation can take 30-60+ seconds).
+
+  const healthFile = path.join(
+    process.env.HOME || process.env.USERPROFILE || "/home/node",
+    ".openclaw",
+    "signals",
+    "penny-collector-meta.json",
+  );
+
+  const writeHealth = () => {
+    const status = {
+      lastPing: new Date().toISOString(),
+      openPositions: executor.getPositionCount(),
+      assets: config.assets,
+    };
+    const tmpPath = healthFile + ".tmp";
+    try {
+      const dir = path.dirname(healthFile);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(tmpPath, JSON.stringify(status, null, 2));
+      fs.renameSync(tmpPath, healthFile);
+    } catch (err) {
+      console.error(`${LOG_PREFIX} Health write failed:`, err instanceof Error ? err.message : String(err));
+      try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+    }
+  };
+
+  // Stamp a fresh ping immediately so the healthcheck passes during slow init
+  writeHealth();
+  const healthInterval = setInterval(writeHealth, 120_000);
 
   // Hydrate dedup set from existing portfolio positions (survives container restarts)
   await executor.init();
@@ -160,36 +214,6 @@ async function main(): Promise<void> {
       scanning = false;
     }
   }, config.scanIntervalMs);
-
-  // ─── Health ping (2min) ───────────────────────────────────────────────
-
-  const healthFile = path.join(
-    process.env.HOME || process.env.USERPROFILE || "/home/node",
-    ".openclaw",
-    "signals",
-    "penny-collector-meta.json",
-  );
-
-  const writeHealth = () => {
-    const status = {
-      lastPing: new Date().toISOString(),
-      openPositions: executor.getPositionCount(),
-      assets: config.assets,
-    };
-    const tmpPath = healthFile + ".tmp";
-    try {
-      const dir = path.dirname(healthFile);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(tmpPath, JSON.stringify(status, null, 2));
-      fs.renameSync(tmpPath, healthFile);
-    } catch (err) {
-      console.error(`${LOG_PREFIX} Health write failed:`, err instanceof Error ? err.message : String(err));
-      try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
-    }
-  };
-
-  writeHealth();
-  const healthInterval = setInterval(writeHealth, 120_000);
 
   // ─── Shutdown ─────────────────────────────────────────────────────────
 
