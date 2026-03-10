@@ -279,6 +279,24 @@ the entry would be missed (stale price check causes the scanner to skip the cand
 close→reconnect path. Eliminates the zombie-timer delay entirely.
 *(Implemented via `fix/penny-clob-snapshot-immediate-reconnect`)*
 
+### IN-12: Timeout on getPortfolioValue() in init() — prevents indefinite startup hang ⭐ FIXED
+**Observed:** Service started (logged up to "Telegram: configured"), then hung indefinitely
+at `await executor.init()` for 3+ minutes without reaching "Running. Scan every 5s."
+Root cause: `init()` calls `getPortfolioValue()` with NO timeout. The same API that caused
+90-174s blocking in `checkResolutions()` (IN-8) also blocks `init()` — but in `init()`,
+the ENTIRE startup is blocked. The scan loop never starts, meaning buy windows are completely
+missed for the duration of the hang. With SIGHUP restarts every 3-10 minutes, every other
+restart could miss an entire 15m window.
+**Root cause:** IN-8 added `Promise.race([getPortfolioValue(), 12s timeout])` to
+`checkResolutions()` but the same protection was never applied to `init()`.
+**Fix:** Added `const INIT_TIMEOUT_MS = 15_000` and wrapped `getPortfolioValue()` in
+`Promise.race()` in `init()`. If the API times out, the existing catch block logs a
+non-fatal warning and the service proceeds with an empty dedup set (safe — dedup will be
+populated by `hydratePositionsFromJournal()` and the first portfolio check in the next cycle).
+After fix: service reliably reaches "Running. Scan every 5s." within 15s of startup even
+when portfolio API is slow.
+*(Implemented via `fix/penny-init-portfolio-timeout`)*
+
 ### IN-11: Remove `su` from Docker entrypoint to eliminate SIGHUP restarts entirely
 **Observed:** Even with the SIGHUP handler (IN-9), the container restarts every 3-10 minutes due to
 `su -s /bin/sh node -c '...'` creating a PAM session that terminates and sends SIGHUP. Each restart
