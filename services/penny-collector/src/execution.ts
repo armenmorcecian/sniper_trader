@@ -28,12 +28,95 @@ export class PennyExecutor {
             this.betConditionIds.add(pos.conditionId);
           }
         }
-        if (this.betConditionIds.size > 0) {
-          console.log(`${LOG_PREFIX} Hydrated ${this.betConditionIds.size} existing positions into dedup set`);
-        }
       }
     } catch (err) {
       console.warn(`${LOG_PREFIX} Could not hydrate positions (non-fatal):`, err instanceof Error ? err.message : String(err));
+    }
+
+    // Hydrate positions Map from trade journal (survives restarts when portfolio API misses tokens)
+    let journalCount = 0;
+    try {
+      const allTrades = queryTrades({ skill: "polymarket" });
+      const now = Date.now();
+      const TWO_HOURS_MS = 2 * 3600 * 1000;
+
+      for (const trade of allTrades) {
+        // Only penny-collector buy fills with no exit price
+        if (trade.tool !== "penny-collector:buy") continue;
+        if (trade.status !== "filled") continue;
+        if (trade.exitPrice != null) continue;
+
+        // Parse metadata
+        let meta: Record<string, unknown>;
+        try {
+          meta = trade.metadata ?? {};
+        } catch {
+          continue;
+        }
+        if (meta.source !== "penny-collector") continue;
+        if (!meta.endDate || typeof meta.endDate !== "string") continue;
+
+        // Skip if endDate is more than 2 hours in the past
+        const endMs = new Date(meta.endDate).getTime();
+        if (now - endMs > TWO_HOURS_MS) continue;
+
+        const conditionId = trade.conditionId ?? trade.symbol ?? "";
+        if (!conditionId) continue;
+
+        // Skip if already in positions Map (avoid double-hydration)
+        if (this.positions.has(conditionId)) continue;
+
+        const tokenId = typeof meta.tokenId === "string" ? meta.tokenId : "";
+        const asset = typeof meta.asset === "string" ? meta.asset : "BTC";
+        const timeframe = typeof meta.timeframe === "string" ? meta.timeframe : "5m";
+        const side = (trade.outcome === "Up" || trade.outcome === "Down") ? trade.outcome : "Up";
+        const entryPrice = trade.price ?? 0;
+        const amount = trade.amount ?? 0;
+        const tradeId = trade.id ?? 0;
+
+        // Reconstruct a minimal CandleMarket
+        const market = {
+          conditionId,
+          upTokenId: side === "Up" ? tokenId : "",
+          downTokenId: side === "Down" ? tokenId : "",
+          asset: asset as import("./types").Asset,
+          timeframe: timeframe as import("./types").Timeframe,
+          endDate: meta.endDate,
+          liquidityNum: 0,
+          // Required fields for CandleMarket — fill with stubs
+          question: "",
+          slug: "",
+          startDate: "",
+          clobTokenIds: [tokenId],
+          outcomePrices: [],
+          volumeNum: 0,
+        };
+
+        const position: PennyPosition = {
+          conditionId,
+          market,
+          side,
+          entryPrice,
+          entryTime: trade.timestamp ? new Date(trade.timestamp).getTime() : now,
+          amount,
+          tradeId,
+          orderId: "",
+          tokenId,
+          status: "open",
+          tokens: entryPrice > 0 ? amount / entryPrice : undefined,
+        };
+
+        this.positions.set(conditionId, position);
+        this.betConditionIds.add(conditionId);
+        journalCount++;
+      }
+    } catch (err) {
+      console.warn(`${LOG_PREFIX} Could not hydrate positions from journal (non-fatal):`, err instanceof Error ? err.message : String(err));
+    }
+
+    const dedupCount = this.betConditionIds.size;
+    if (dedupCount > 0 || journalCount > 0) {
+      console.log(`${LOG_PREFIX} Hydrated ${dedupCount} existing position(s) from dedup set, ${journalCount} from journal`);
     }
   }
 
