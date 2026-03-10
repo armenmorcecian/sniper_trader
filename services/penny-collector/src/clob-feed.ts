@@ -39,6 +39,7 @@ export class ClobFeed {
   private _proxyUrl: string | undefined;
   private bookBids = new Map<string, Map<string, number>>();  // tokenId → (price_str → size)
   private bookAsks = new Map<string, Map<string, number>>();  // tokenId → (price_str → size)
+  private _pendingSnapshotSince = new Map<string, number>(); // tokenId → when subscribe was sent
 
   constructor(proxyUrl?: string) {
     this._proxyUrl = proxyUrl;
@@ -110,6 +111,7 @@ export class ClobFeed {
         // Always clear the book state (memory) — midpoint is recomputed on next snapshot
         this.bookBids.delete(id);
         this.bookAsks.delete(id);
+        this._pendingSnapshotSince.delete(id);
       }
     }
 
@@ -228,6 +230,8 @@ export class ClobFeed {
       this._lastMessageTime = Date.now();
       this._lastPongTime = Date.now();
 
+      this._pendingSnapshotSince.clear(); // will be repopulated by subscribe() below
+
       // Subscribe to all tracked tokens
       const allTokens = [...this.subscribedTokens, ...this.pendingTokens];
       this.pendingTokens.clear();
@@ -260,6 +264,21 @@ export class ClobFeed {
             );
             this.ws!.terminate();
             return;
+          }
+
+          // Snapshot health check: re-subscribe tokens stuck waiting for initial book snapshot
+          const SNAPSHOT_TIMEOUT_MS = 30_000;
+          const stuckTokens: string[] = [];
+          for (const [tokenId, subscribedAt] of this._pendingSnapshotSince) {
+            if (this.subscribedTokens.has(tokenId) && now - subscribedAt > SNAPSHOT_TIMEOUT_MS) {
+              stuckTokens.push(tokenId);
+            }
+          }
+          if (stuckTokens.length > 0) {
+            console.warn(
+              `${LOG_PREFIX} Re-subscribing ${stuckTokens.length} token(s) with missing initial snapshot (>30s wait)`,
+            );
+            this.subscribe(stuckTokens);
           }
         }
       }, PING_INTERVAL_MS);
@@ -331,6 +350,13 @@ export class ClobFeed {
       type: "market",
     });
     this.ws.send(msg);
+    // Track tokens waiting for their initial snapshot
+    const now = Date.now();
+    for (const id of tokenIds) {
+      if (!this._prices.has(id)) {
+        this._pendingSnapshotSince.set(id, now);
+      }
+    }
     console.log(`${LOG_PREFIX} Subscribed to ${tokenIds.length} token(s)`);
   }
 
@@ -373,6 +399,7 @@ export class ClobFeed {
     this._priceEmitCount++;
     this._prices.set(assetId, price);
     this._lastUpdateMs.set(assetId, Date.now());
+    this._pendingSnapshotSince.delete(assetId); // snapshot received
     for (const cb of this.priceCallbacks) {
       cb(assetId, price);
     }
