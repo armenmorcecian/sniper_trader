@@ -39,6 +39,8 @@ export class ClobFeed {
   private _proxyUrl: string | undefined;
   private bookBids = new Map<string, Map<string, number>>();  // tokenId → (price_str → size)
   private bookAsks = new Map<string, Map<string, number>>();  // tokenId → (price_str → size)
+  private _pendingSnapshotSince = new Map<string, number>(); // tokenId → when subscribe was sent
+  private _snapshotRetryCount = new Map<string, number>(); // tokenId → retry attempts so far
 
   constructor(proxyUrl?: string) {
     this._proxyUrl = proxyUrl;
@@ -55,6 +57,23 @@ export class ClobFeed {
   getPriceAge(tokenId: string): number {
     const last = this._lastUpdateMs.get(tokenId);
     return last ? Date.now() - last : Infinity;
+  }
+
+  /**
+   * Get total USD value of ask-side liquidity at or below maxPrice for a token.
+   * Returns 0 if no book data available.
+   */
+  getAskDepthUsd(tokenId: string, maxPrice: number): number {
+    const asks = this.bookAsks.get(tokenId);
+    if (!asks) return 0;
+    let totalUsd = 0;
+    for (const [priceStr, size] of asks) {
+      const price = parseFloat(priceStr);
+      if (!isNaN(price) && price <= maxPrice && size > 0) {
+        totalUsd += price * size;
+      }
+    }
+    return totalUsd;
   }
 
   /** Register callback for price updates */
@@ -74,22 +93,41 @@ export class ClobFeed {
       }
     }
 
-    // Remove stale tokens from price cache and book state
+    // Remove stale tokens from price cache and book state.
+    // Preserve prices received within the last 5 minutes — during market cycle
+    // transitions, Gamma briefly drops the expiring token from active markets,
+    // causing setTokens() to remove it. The token is re-added milliseconds later,
+    // but by then the price is gone and the expiring book may be too quiet to
+    // send a new snapshot, causing the entire buy window to show as STALE.
+    const now = Date.now();
     for (const id of this.subscribedTokens) {
       if (!newSet.has(id)) {
-        this._prices.delete(id);
-        this._lastUpdateMs.delete(id);
+        const lastUpdate = this._lastUpdateMs.get(id);
+        const ageMs = lastUpdate !== undefined ? now - lastUpdate : Infinity;
+        if (ageMs > 300_000) {
+          // Price is old enough to safely discard
+          this._prices.delete(id);
+          this._lastUpdateMs.delete(id);
+        }
+        // Always clear the book state (memory) — midpoint is recomputed on next snapshot
         this.bookBids.delete(id);
         this.bookAsks.delete(id);
+        this._pendingSnapshotSince.delete(id);
+        this._snapshotRetryCount.delete(id);
       }
     }
 
     this.subscribedTokens = newSet;
 
     if (toAdd.length > 0 && this.ws?.readyState === WebSocket.OPEN) {
+      // Reset retry count for freshly added tokens before subscribing
+      for (const id of toAdd) this._snapshotRetryCount.delete(id);
       this.subscribe(toAdd);
     } else if (toAdd.length > 0) {
-      for (const id of toAdd) this.pendingTokens.add(id);
+      for (const id of toAdd) {
+        this._snapshotRetryCount.delete(id);
+        this.pendingTokens.add(id);
+      }
     }
   }
 
@@ -199,6 +237,8 @@ export class ClobFeed {
       this._lastMessageTime = Date.now();
       this._lastPongTime = Date.now();
 
+      this._pendingSnapshotSince.clear(); // will be repopulated by subscribe() below
+
       // Subscribe to all tracked tokens
       const allTokens = [...this.subscribedTokens, ...this.pendingTokens];
       this.pendingTokens.clear();
@@ -229,6 +269,50 @@ export class ClobFeed {
             console.warn(
               `${LOG_PREFIX} Zombie detected: no pong for ${Math.round((now - this._lastPongTime) / 1000)}s — force reconnecting`,
             );
+            this.ws!.terminate();
+            return;
+          }
+
+          // Snapshot health check: re-subscribe tokens stuck waiting for initial book snapshot.
+          // Cap at 3 retries — after that, the server has no snapshot to send (e.g., empty book
+          // on a newly started market). Prices will arrive via price_change/last_trade_price events
+          // once the market becomes active.
+          const SNAPSHOT_TIMEOUT_MS = 30_000;
+          const MAX_SNAPSHOT_RETRIES = 3;
+          const stuckTokens: string[] = [];
+          let gaveUp = false;
+          for (const [tokenId, subscribedAt] of this._pendingSnapshotSince) {
+            if (!this.subscribedTokens.has(tokenId)) {
+              this._pendingSnapshotSince.delete(tokenId);
+              this._snapshotRetryCount.delete(tokenId);
+              continue;
+            }
+            const retries = this._snapshotRetryCount.get(tokenId) ?? 0;
+            if (retries >= MAX_SNAPSHOT_RETRIES) {
+              // Give up — remove from pending so we stop logging/retrying
+              this._pendingSnapshotSince.delete(tokenId);
+              this._snapshotRetryCount.delete(tokenId);
+              console.log(`${LOG_PREFIX} Snapshot timeout: giving up on ${tokenId.slice(0, 12)} after ${retries} retries`);
+              gaveUp = true;
+              continue;
+            }
+            if (now - subscribedAt > SNAPSHOT_TIMEOUT_MS) {
+              stuckTokens.push(tokenId);
+            }
+          }
+          if (stuckTokens.length > 0) {
+            for (const id of stuckTokens) {
+              this._snapshotRetryCount.set(id, (this._snapshotRetryCount.get(id) ?? 0) + 1);
+            }
+            const attempt = this._snapshotRetryCount.get(stuckTokens[0]) ?? 1;
+            console.warn(
+              `${LOG_PREFIX} Re-subscribing ${stuckTokens.length} token(s) with missing initial snapshot (attempt ${attempt}/${MAX_SNAPSHOT_RETRIES})`,
+            );
+            this.subscribe(stuckTokens);
+          } else if (gaveUp && this._pendingSnapshotSince.size === 0 && this.subscribedTokens.size > 0) {
+            // All snapshot retries exhausted and no recovery is pending — reconnect now
+            // rather than waiting 30-90s for the zombie timer to fire.
+            console.warn(`${LOG_PREFIX} All snapshot retries exhausted — force reconnecting now`);
             this.ws!.terminate();
             return;
           }
@@ -302,6 +386,13 @@ export class ClobFeed {
       type: "market",
     });
     this.ws.send(msg);
+    // Track tokens waiting for their initial snapshot
+    const now = Date.now();
+    for (const id of tokenIds) {
+      if (!this._prices.has(id)) {
+        this._pendingSnapshotSince.set(id, now);
+      }
+    }
     console.log(`${LOG_PREFIX} Subscribed to ${tokenIds.length} token(s)`);
   }
 
@@ -344,6 +435,7 @@ export class ClobFeed {
     this._priceEmitCount++;
     this._prices.set(assetId, price);
     this._lastUpdateMs.set(assetId, Date.now());
+    this._pendingSnapshotSince.delete(assetId); // snapshot received
     for (const cb of this.priceCallbacks) {
       cb(assetId, price);
     }
@@ -353,7 +445,7 @@ export class ClobFeed {
     const eventType = String(event.event_type ?? "");
 
     // ── book: full order book snapshot (top-level asset_id, bids/asks arrays) ──
-    if (eventType === "book" && Array.isArray(event.bids) && Array.isArray(event.asks)) {
+    if ((eventType === "book" || !eventType) && Array.isArray(event.bids) && Array.isArray(event.asks)) {
       const assetId = String(event.asset_id ?? "");
       if (!assetId || !this.subscribedTokens.has(assetId)) return;
       this._bookEventCount++;
@@ -372,6 +464,7 @@ export class ClobFeed {
       }
       this.bookBids.set(assetId, bids);
       this.bookAsks.set(assetId, asks);
+      this._pendingSnapshotSince.delete(assetId); // snapshot received — stop retrying even if book is empty
 
       const mid = this.computeMidpoint(assetId);
       if (mid !== null && !isNaN(mid) && mid > 0 && mid < 1) {
