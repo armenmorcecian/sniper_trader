@@ -11,7 +11,8 @@ import type { MarketDiscovery } from "./market-discovery";
 import type { ClobFeed } from "./clob-feed";
 
 const LOG_PREFIX = "[expiry-scanner]";
-const CLOB_PRICE_MAX_AGE_MS = 30_000; // consider WS price stale after 30s
+const CLOB_PRICE_MAX_AGE_MS = 30_000;        // normal stale threshold
+const CLOB_PRICE_NEAR_EXPIRY_AGE_MS = 300_000; // 5-min threshold when book goes quiet at convergence
 
 export class ExpiryScanner {
   constructor(
@@ -33,19 +34,20 @@ export class ExpiryScanner {
       if (secondsRemaining < this.config.minSecondsBeforeExpiry ||
           secondsRemaining > this.config.maxSecondsBeforeExpiry) continue;
 
-      // CLOB WS prices only — skip if stale or missing
+      // CLOB WS prices only — skip if stale or missing.
+      // Near expiry, the order book goes quiet as the market converges to 0/1
+      // and trading activity dries up. Use an extended stale threshold in that
+      // case: a price received within the last 5 minutes is still a valid
+      // directional signal even if no new book updates have arrived.
       const upPrice = this.clobFeed.getPrice(market.upTokenId);
       const downPrice = this.clobFeed.getPrice(market.downTokenId);
-      const upFresh = upPrice > 0 && this.clobFeed.getPriceAge(market.upTokenId) < CLOB_PRICE_MAX_AGE_MS;
-      const downFresh = downPrice > 0 && this.clobFeed.getPriceAge(market.downTokenId) < CLOB_PRICE_MAX_AGE_MS;
+      const staleThresholdMs = secondsRemaining < this.config.maxSecondsBeforeExpiry
+        ? CLOB_PRICE_NEAR_EXPIRY_AGE_MS
+        : CLOB_PRICE_MAX_AGE_MS;
+      const upFresh = upPrice > 0 && this.clobFeed.getPriceAge(market.upTokenId) < staleThresholdMs;
+      const downFresh = downPrice > 0 && this.clobFeed.getPriceAge(market.downTokenId) < staleThresholdMs;
 
       if (!upFresh || !downFresh) {
-        // CLOB price is stale — skip rather than use Gamma fallback.
-        // Gamma outcomePrices lag by minutes during final expiry convergence: if the
-        // winning side has moved to $0.99+ (CLOB goes quiet), Gamma still shows the
-        // old price (e.g. $0.975), causing slippage rejects on every buy attempt.
-        // CLOB reconnects within 5-10s; it's safer to miss one scan than buy at a
-        // stale price that will be rejected.
         console.log(
           `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
           `stale CLOB (up=${upPrice.toFixed(3)} ${upFresh ? "fresh" : "STALE"}, ` +
