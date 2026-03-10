@@ -122,13 +122,61 @@ export class PennyExecutor {
         } catch (err) {
           console.error(`${LOG_PREFIX} Slippage sell-back failed:`, err instanceof Error ? err.message : String(err));
         }
-        // Release dedup lock after sell-back so we can retry if price moves back
-        // into range before the window closes. If sell-back failed we still release —
-        // positions.size >= maxConcurrentPositions is the safety net against double-buying.
-        this.betConditionIds.delete(candidate.market.conditionId);
+
         if (!sellBackSucceeded) {
-          console.warn(`${LOG_PREFIX} Slippage sell-back failed — releasing dedup lock anyway (positions guard active)`);
+          // Sell-back failed — tokens are stuck in the wallet. Track the position
+          // so checkResolutions() can attempt redemption at expiry (if it won).
+          // Keep dedup lock so we don't double-buy the same conditionId.
+          console.warn(
+            `${LOG_PREFIX} Slippage sell-back failed — tracking position for expiry resolution ` +
+            `(conditionId=${candidate.market.conditionId.slice(0, 12)})`,
+          );
+          let tradeId = 0;
+          try {
+            tradeId = recordTrade({
+              skill: "polymarket",
+              tool: "penny-collector:buy",
+              symbol: candidate.market.conditionId,
+              conditionId: candidate.market.conditionId,
+              side: "BUY",
+              amount: result.totalCost,
+              price: fillPrice,
+              status: "filled",
+              outcome: candidate.winningSide,
+              metadata: {
+                source: "penny-collector",
+                asset: candidate.market.asset,
+                timeframe: candidate.market.timeframe,
+                secondsRemaining: candidate.secondsRemaining,
+                expectedProfit: candidate.expectedProfit,
+                tokenId: candidate.tokenId,
+                endDate: candidate.market.endDate,
+                slippageReject: true,
+              },
+            });
+          } catch (journalErr) {
+            console.error(`${LOG_PREFIX} Failed to record slippage-reject trade (non-fatal):`, journalErr instanceof Error ? journalErr.message : String(journalErr));
+          }
+          this.positions.set(candidate.market.conditionId, {
+            conditionId: candidate.market.conditionId,
+            market: candidate.market,
+            side: candidate.winningSide,
+            entryPrice: fillPrice,
+            entryTime: Date.now(),
+            amount: result.totalCost,
+            tradeId,
+            orderId: result.orderId,
+            tokenId: candidate.tokenId,
+            status: "open",
+            tokens: result.size,
+            stopLossUnexecutable: true, // already failed to sell — skip stop-loss attempts
+          });
+          this.betsThisHour.push(Date.now());
+          return false; // don't count as a normal fill — position guard will block new buys
         }
+
+        // Sell-back succeeded — release dedup lock so we can retry if price re-enters range
+        this.betConditionIds.delete(candidate.market.conditionId);
         return false;
       }
 
