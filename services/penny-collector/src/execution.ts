@@ -102,8 +102,6 @@ export class PennyExecutor {
 
       // Post-fill price guard: reject if slippage pushed fill price above max threshold
       // (lower fills are fine — cheaper entry = more profit when contract resolves at $1)
-      // NOTE: Do NOT clear betConditionIds here — the order DID fill, so we must
-      // keep the dedup lock to prevent double-buying on the next scan cycle.
       const fillPrice = result.price > 0 ? result.price : candidate.winningPrice;
 
       if (fillPrice > this.config.maxWinningPrice) {
@@ -111,6 +109,7 @@ export class PennyExecutor {
           `${LOG_PREFIX} SLIPPAGE REJECT (max): fill $${fillPrice.toFixed(3)} > max $${this.config.maxWinningPrice} — ` +
           `selling back ${candidate.market.asset} ${candidate.market.timeframe} ${candidate.winningSide}`,
         );
+        let sellBackSucceeded = false;
         try {
           const shares = result.totalCost / fillPrice;
           await this.service.fastMarketBuy({
@@ -118,10 +117,66 @@ export class PennyExecutor {
             amount: shares,
             side: "SELL",
           });
+          sellBackSucceeded = true;
+          console.log(`${LOG_PREFIX} Slippage sell-back succeeded — dedup lock released for retry`);
         } catch (err) {
           console.error(`${LOG_PREFIX} Slippage sell-back failed:`, err instanceof Error ? err.message : String(err));
         }
-        // Keep betConditionIds locked — never re-buy a market we already filled on
+
+        if (!sellBackSucceeded) {
+          // Sell-back failed — tokens are stuck in the wallet. Track the position
+          // so checkResolutions() can attempt redemption at expiry (if it won).
+          // Keep dedup lock so we don't double-buy the same conditionId.
+          console.warn(
+            `${LOG_PREFIX} Slippage sell-back failed — tracking position for expiry resolution ` +
+            `(conditionId=${candidate.market.conditionId.slice(0, 12)})`,
+          );
+          let tradeId = 0;
+          try {
+            tradeId = recordTrade({
+              skill: "polymarket",
+              tool: "penny-collector:buy",
+              symbol: candidate.market.conditionId,
+              conditionId: candidate.market.conditionId,
+              side: "BUY",
+              amount: result.totalCost,
+              price: fillPrice,
+              status: "filled",
+              outcome: candidate.winningSide,
+              metadata: {
+                source: "penny-collector",
+                asset: candidate.market.asset,
+                timeframe: candidate.market.timeframe,
+                secondsRemaining: candidate.secondsRemaining,
+                expectedProfit: candidate.expectedProfit,
+                tokenId: candidate.tokenId,
+                endDate: candidate.market.endDate,
+                slippageReject: true,
+              },
+            });
+          } catch (journalErr) {
+            console.error(`${LOG_PREFIX} Failed to record slippage-reject trade (non-fatal):`, journalErr instanceof Error ? journalErr.message : String(journalErr));
+          }
+          this.positions.set(candidate.market.conditionId, {
+            conditionId: candidate.market.conditionId,
+            market: candidate.market,
+            side: candidate.winningSide,
+            entryPrice: fillPrice,
+            entryTime: Date.now(),
+            amount: result.totalCost,
+            tradeId,
+            orderId: result.orderId,
+            tokenId: candidate.tokenId,
+            status: "open",
+            tokens: result.size,
+            stopLossUnexecutable: true, // already failed to sell — skip stop-loss attempts
+          });
+          this.betsThisHour.push(Date.now());
+          return false; // don't count as a normal fill — position guard will block new buys
+        }
+
+        // Sell-back succeeded — release dedup lock so we can retry if price re-enters range
+        this.betConditionIds.delete(candidate.market.conditionId);
         return false;
       }
 
@@ -162,6 +217,7 @@ export class PennyExecutor {
         orderId: result.orderId,
         tokenId: candidate.tokenId,
         status: "open",
+        tokens: result.size,
       });
 
       this.betsThisHour.push(Date.now());
@@ -183,6 +239,8 @@ export class PennyExecutor {
   async checkStopLosses(clobFeed: ClobFeed): Promise<void> {
     for (const [conditionId, pos] of this.positions) {
       if (pos.status !== "open") continue;
+      if (pos.stopLossExhausted) continue;
+      if (pos.stopLossUnexecutable) continue;
 
       const currentPrice = clobFeed.getPrice(pos.tokenId);
       if (currentPrice <= 0) continue; // no price data yet
@@ -198,9 +256,18 @@ export class PennyExecutor {
         `@ $${pos.entryPrice.toFixed(3)} -> $${currentPrice.toFixed(3)} (${pnlPct.toFixed(1)}%)`,
       );
 
+      const shares = pos.tokens ?? (pos.amount / pos.entryPrice);
+      const MIN_SHARE_PRICE = 0.50;
+      if (currentPrice < MIN_SHARE_PRICE) {
+        console.warn(
+          `${LOG_PREFIX} STOP-LOSS: ${pos.market.asset}/${pos.market.timeframe} price $${currentPrice.toFixed(3)} < $${MIN_SHARE_PRICE} floor — holding to expiry`,
+        );
+        pos.stopLossExhausted = true;
+        continue;
+      }
+
       // Sell via CLOB
       try {
-        const shares = pos.amount / pos.entryPrice;
         const sellResult = await this.service.fastMarketBuy({
           tokenId: pos.tokenId,
           amount: shares,
@@ -222,7 +289,18 @@ export class PennyExecutor {
 
         pos.status = "sold";
       } catch (err) {
-        console.error(`${LOG_PREFIX} Stop-loss sell failed:`, err instanceof Error ? err.message : String(err));
+        const msg = err instanceof Error ? err.message : String(err);
+        const body = (err as any)?.response?.data ? JSON.stringify((err as any).response.data) : '';
+        const isBalanceError = body.includes('not enough balance') || msg.includes('not enough balance');
+        if (isBalanceError) {
+          console.warn(
+            `${LOG_PREFIX} Stop-loss sell blocked: CLOB reports "not enough balance / allowance" — ` +
+            `tokens from builder-relayer fill are not in CTF Exchange proxy. Holding to expiry.`,
+          );
+          pos.stopLossUnexecutable = true;
+        } else {
+          console.error(`${LOG_PREFIX} Stop-loss sell failed:`, msg, body || '');
+        }
       }
     }
   }

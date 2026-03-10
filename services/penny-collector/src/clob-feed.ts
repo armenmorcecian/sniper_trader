@@ -57,6 +57,23 @@ export class ClobFeed {
     return last ? Date.now() - last : Infinity;
   }
 
+  /**
+   * Get total USD value of ask-side liquidity at or below maxPrice for a token.
+   * Returns 0 if no book data available.
+   */
+  getAskDepthUsd(tokenId: string, maxPrice: number): number {
+    const asks = this.bookAsks.get(tokenId);
+    if (!asks) return 0;
+    let totalUsd = 0;
+    for (const [priceStr, size] of asks) {
+      const price = parseFloat(priceStr);
+      if (!isNaN(price) && price <= maxPrice && size > 0) {
+        totalUsd += price * size;
+      }
+    }
+    return totalUsd;
+  }
+
   /** Register callback for price updates */
   onPrice(callback: PriceCallback): void {
     this.priceCallbacks.push(callback);
@@ -74,11 +91,23 @@ export class ClobFeed {
       }
     }
 
-    // Remove stale tokens from price cache and book state
+    // Remove stale tokens from price cache and book state.
+    // Preserve prices received within the last 5 minutes — during market cycle
+    // transitions, Gamma briefly drops the expiring token from active markets,
+    // causing setTokens() to remove it. The token is re-added milliseconds later,
+    // but by then the price is gone and the expiring book may be too quiet to
+    // send a new snapshot, causing the entire buy window to show as STALE.
+    const now = Date.now();
     for (const id of this.subscribedTokens) {
       if (!newSet.has(id)) {
-        this._prices.delete(id);
-        this._lastUpdateMs.delete(id);
+        const lastUpdate = this._lastUpdateMs.get(id);
+        const ageMs = lastUpdate !== undefined ? now - lastUpdate : Infinity;
+        if (ageMs > 300_000) {
+          // Price is old enough to safely discard
+          this._prices.delete(id);
+          this._lastUpdateMs.delete(id);
+        }
+        // Always clear the book state (memory) — midpoint is recomputed on next snapshot
         this.bookBids.delete(id);
         this.bookAsks.delete(id);
       }
@@ -353,7 +382,7 @@ export class ClobFeed {
     const eventType = String(event.event_type ?? "");
 
     // ── book: full order book snapshot (top-level asset_id, bids/asks arrays) ──
-    if (eventType === "book" && Array.isArray(event.bids) && Array.isArray(event.asks)) {
+    if ((eventType === "book" || !eventType) && Array.isArray(event.bids) && Array.isArray(event.asks)) {
       const assetId = String(event.asset_id ?? "");
       if (!assetId || !this.subscribedTokens.has(assetId)) return;
       this._bookEventCount++;
