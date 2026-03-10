@@ -241,3 +241,23 @@ the entry would be missed (stale price check causes the scanner to skip the cand
 && subscribedTokens.size > 0`), immediately call `ws.terminate()` to trigger the existing
 close→reconnect path. Eliminates the zombie-timer delay entirely.
 *(Implemented via `fix/penny-clob-snapshot-immediate-reconnect`)*
+
+### IN-11: Remove `su` from Docker entrypoint to eliminate SIGHUP restarts entirely
+**Observed:** Even with the SIGHUP handler (IN-9), the container restarts every 3-10 minutes due to
+`su -s /bin/sh node -c '...'` creating a PAM session that terminates and sends SIGHUP. Each restart
+causes a fresh CLOB reconnect, re-subscription, and snapshot fetch (~5-10s gap). Observed impact:
+SIGHUP at 5m27s remaining → service restarted at 3m20s, missing ~2 minutes of pre-window monitoring
+(the 200s→180s stability count period). In this window prices stayed out of range so no entry was
+missed, but if BTC converged to $0.88+ in the 5m-3m20s window, the SQ-5 stability counter would
+reset on restart, potentially delaying entry by one extra 5s tick.
+**Fix options:**
+1. Replace `su -s /bin/sh node -c '...'` in `entrypoint.sh` with `exec gosu node tsx ...` (requires
+   `gosu` installed in Dockerfile). `gosu` sets UID/GID and execs without creating a PAM session.
+2. Set `USER node` in Dockerfile and use `CMD ["npx", "tsx", "src/index.ts"]` directly — avoids `su`
+   entirely if the node user already has correct file permissions on `/home/node/.openclaw`.
+3. Use `exec su-exec node tsx ...` (Alpine-compatible alternative to gosu).
+**Impact:** Eliminates all SIGHUP restarts, giving the service uninterrupted uptime. Combined with
+IN-7 (journal hydration) and IN-10 (snapshot reconnect), the service would only restart on genuine
+errors — not PAM session timeouts.
+**Trade-off:** Requires Dockerfile change + image rebuild. `gosu` or `su-exec` must be installed
+at build time. File ownership of `/home/node/.openclaw` must be verified for the node user.
