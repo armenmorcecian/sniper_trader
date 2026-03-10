@@ -125,7 +125,7 @@ async function main(): Promise<void> {
       const candidates = await scanner.findCandidates();
 
       for (const candidate of candidates) {
-        const bought = await executor.executeBuy(candidate);
+        const bought = await executor.executeBuy(candidate, clobFeed);
         if (bought) {
           await sendTelegram(
             `*Penny Buy* ${candidate.market.asset} ${candidate.market.timeframe} ${candidate.winningSide}\n` +

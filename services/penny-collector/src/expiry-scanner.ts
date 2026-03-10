@@ -151,6 +151,10 @@ export class ExpiryScanner {
         tokenId,
         expectedProfit,
       });
+      // Reset stability counter after emitting — requires 2 fresh in-range scans
+      // before the next retry, adding a natural ~6-10s cooldown for book replenishment.
+      // Without this, a FOK failure causes immediate re-emit on the very next scan tick.
+      this._consecutiveInRange.delete(tokenId);
     }
 
     // Sort by highest expected profit (lowest price = most profit)

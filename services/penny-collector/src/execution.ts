@@ -45,7 +45,7 @@ export class PennyExecutor {
     return [...this.positions.values()];
   }
 
-  async executeBuy(candidate: PennyCandidate): Promise<boolean> {
+  async executeBuy(candidate: PennyCandidate, clobFeed?: ClobFeed): Promise<boolean> {
     // Dedup
     if (this.betConditionIds.has(candidate.market.conditionId)) return false;
 
@@ -229,7 +229,19 @@ export class PennyExecutor {
 
       return true;
     } catch (err) {
-      console.error(`${LOG_PREFIX} Buy failed:`, err instanceof Error ? err.message : String(err));
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const isFok = errMsg.includes('400') || String((err as any)?.response?.data).includes('fully filled');
+      console.error(`${LOG_PREFIX} Buy failed:`, errMsg);
+      // IN-6: Log ask depth at FOK failure to diagnose race condition vs stale book
+      if (isFok && clobFeed) {
+        const depthAtFail = clobFeed.getAskDepthUsd(candidate.tokenId, this.config.maxWinningPrice);
+        const tightDepthAtFail = clobFeed.getAskDepthUsd(candidate.tokenId, candidate.winningPrice + 0.050);
+        if (depthAtFail < this.config.maxBetAmount) {
+          console.log(`${LOG_PREFIX} [FOK-diag] depth after fail: $${depthAtFail.toFixed(2)} total, $${tightDepthAtFail.toFixed(2)} tight — SQ-2 RACE: asks pulled before order`);
+        } else {
+          console.log(`${LOG_PREFIX} [FOK-diag] depth after fail: $${depthAtFail.toFixed(2)} total, $${tightDepthAtFail.toFixed(2)} tight — book still has depth (stale snapshot or spread issue)`);
+        }
+      }
       this.betConditionIds.delete(candidate.market.conditionId);
       return false;
     }
