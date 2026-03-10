@@ -102,8 +102,6 @@ export class PennyExecutor {
 
       // Post-fill price guard: reject if slippage pushed fill price above max threshold
       // (lower fills are fine — cheaper entry = more profit when contract resolves at $1)
-      // NOTE: Do NOT clear betConditionIds here — the order DID fill, so we must
-      // keep the dedup lock to prevent double-buying on the next scan cycle.
       const fillPrice = result.price > 0 ? result.price : candidate.winningPrice;
 
       if (fillPrice > this.config.maxWinningPrice) {
@@ -111,6 +109,7 @@ export class PennyExecutor {
           `${LOG_PREFIX} SLIPPAGE REJECT (max): fill $${fillPrice.toFixed(3)} > max $${this.config.maxWinningPrice} — ` +
           `selling back ${candidate.market.asset} ${candidate.market.timeframe} ${candidate.winningSide}`,
         );
+        let sellBackSucceeded = false;
         try {
           const shares = result.totalCost / fillPrice;
           await this.service.fastMarketBuy({
@@ -118,10 +117,18 @@ export class PennyExecutor {
             amount: shares,
             side: "SELL",
           });
+          sellBackSucceeded = true;
+          console.log(`${LOG_PREFIX} Slippage sell-back succeeded — dedup lock released for retry`);
         } catch (err) {
           console.error(`${LOG_PREFIX} Slippage sell-back failed:`, err instanceof Error ? err.message : String(err));
         }
-        // Keep betConditionIds locked — never re-buy a market we already filled on
+        // Release dedup lock after sell-back so we can retry if price moves back
+        // into range before the window closes. If sell-back failed we still release —
+        // positions.size >= maxConcurrentPositions is the safety net against double-buying.
+        this.betConditionIds.delete(candidate.market.conditionId);
+        if (!sellBackSucceeded) {
+          console.warn(`${LOG_PREFIX} Slippage sell-back failed — releasing dedup lock anyway (positions guard active)`);
+        }
         return false;
       }
 
