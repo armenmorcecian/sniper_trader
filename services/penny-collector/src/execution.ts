@@ -35,6 +35,52 @@ export class PennyExecutor {
     } catch (err) {
       console.warn(`${LOG_PREFIX} Could not hydrate positions (non-fatal):`, err instanceof Error ? err.message : String(err));
     }
+
+    await this.redeemOrphanedWinners();
+  }
+
+  /**
+   * Redeem tokens for positions that were journaled as exitPrice=1.00 but whose
+   * redemption was never confirmed (e.g. process crashed between journal write and
+   * redeemWinningTokens completing). Cross-references betConditionIds to confirm
+   * tokens are still in the wallet before attempting redemption.
+   */
+  private async redeemOrphanedWinners(): Promise<void> {
+    if (!this.service.redeemWinningTokens) return;
+
+    try {
+      const since = new Date(Date.now() - 24 * 3_600_000).toISOString();
+      const trades = queryTrades({ skill: "polymarket", since });
+
+      const orphans = trades.filter(
+        (t) =>
+          t.tool === "penny-collector:buy" &&
+          t.exitPrice != null &&
+          t.exitPrice === 1.00 &&
+          t.conditionId != null &&
+          this.betConditionIds.has(t.conditionId) &&
+          !this.positions.has(t.conditionId!),
+      );
+
+      for (const trade of orphans) {
+        const conditionId = trade.conditionId!;
+        try {
+          const redeemed = await this.service.redeemWinningTokens(conditionId);
+          if (redeemed) {
+            console.log(`${LOG_PREFIX} Redeemed orphaned winner: ${conditionId.slice(0, 12)}`);
+          } else {
+            console.warn(`${LOG_PREFIX} Orphaned winner redemption returned false: ${conditionId.slice(0, 12)}`);
+          }
+        } catch (err) {
+          console.warn(
+            `${LOG_PREFIX} Orphaned winner redemption failed (non-fatal): ${conditionId.slice(0, 12)}:`,
+            err instanceof Error ? err.message : String(err),
+          );
+        }
+      }
+    } catch (err) {
+      console.warn(`${LOG_PREFIX} redeemOrphanedWinners failed (non-fatal):`, err instanceof Error ? err.message : String(err));
+    }
   }
 
   getPositionCount(): number {
