@@ -38,7 +38,7 @@ services:
       - ${OPENCLAW_CONFIG_DIR}/signals:/home/node/.openclaw/signals
       - signals-native:/home/node/signals-native
     working_dir: /home/node/.openclaw/workspace/services/quant-signals
-    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec su -s /bin/sh node -c 'exec npx tsx src/index.ts'"]
+    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec runuser -u node -- npx tsx src/index.ts"]
     init: true
     restart: unless-stopped
     healthcheck:
@@ -62,7 +62,7 @@ services:
       - ${OPENCLAW_CONFIG_DIR}/signals:/home/node/.openclaw/signals
       - signals-native:/home/node/signals-native
     working_dir: /home/node/.openclaw/workspace/services/risk-monitor
-    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec su -s /bin/sh node -c 'exec npx tsx src/index.ts'"]
+    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec runuser -u node -- npx tsx src/index.ts"]
     init: true
     restart: unless-stopped
     healthcheck:
@@ -86,7 +86,7 @@ services:
       - ${OPENCLAW_CONFIG_DIR}/signals:/home/node/.openclaw/signals
       - signals-native:/home/node/signals-native
     working_dir: /home/node/.openclaw/workspace/services/btc-scalper
-    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec su -s /bin/sh node -c 'exec npx tsx src/index.ts'"]
+    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec runuser -u node -- npx tsx src/index.ts"]
     init: true
     restart: unless-stopped
     healthcheck:
@@ -110,7 +110,7 @@ services:
       - ${OPENCLAW_CONFIG_DIR}/signals:/home/node/.openclaw/signals
       - signals-native:/home/node/signals-native
     working_dir: /home/node/.openclaw/workspace/services/penny-collector
-    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec su -s /bin/sh node -c 'exec npx tsx src/index.ts'"]
+    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec runuser -u node -- npx tsx src/index.ts"]
     init: true
     restart: unless-stopped
     healthcheck:
@@ -134,7 +134,7 @@ services:
       - ${OPENCLAW_CONFIG_DIR}/signals:/home/node/.openclaw/signals
       - signals-native:/home/node/signals-native
     working_dir: /home/node/.openclaw/workspace/services/copycat-wallet
-    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec su -s /bin/sh node -c 'exec npx tsx src/index.ts'"]
+    entrypoint: ["sh", "-c", "chown node:node /home/node/signals-native && ln -sf /home/node/signals-native/trades.db /home/node/.openclaw/signals/trades.db && exec runuser -u node -- npx tsx src/index.ts"]
     init: true
     restart: unless-stopped
     healthcheck:
