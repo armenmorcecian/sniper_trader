@@ -21,6 +21,7 @@ const CLOB_PRICE_NEAR_EXPIRY_AGE_MS = 300_000; // 5-min threshold when book goes
 
 export class ExpiryScanner {
   private _consecutiveInRange = new Map<string, number>();
+  private _settledMarkets = new Set<string>();
 
   constructor(
     private readonly discovery: MarketDiscovery,
@@ -51,6 +52,20 @@ export class ExpiryScanner {
       const staleThresholdMs = secondsRemaining < this.config.maxSecondsBeforeExpiry
         ? CLOB_PRICE_NEAR_EXPIRY_AGE_MS
         : CLOB_PRICE_MAX_AGE_MS;
+
+      // Skip one-sided markets — already converged, will never enter buy window.
+      // Log once per market instance, then silently skip to reduce noise.
+      if (upPrice > 0 && downPrice > 0 && (upPrice < 0.02 || downPrice < 0.02)) {
+        if (!this._settledMarkets.has(market.conditionId)) {
+          console.log(
+            `${LOG_PREFIX} [settled] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
+            `one-sided (up=$${upPrice.toFixed(3)}, down=$${downPrice.toFixed(3)}) — skipping window`,
+          );
+          this._settledMarkets.add(market.conditionId);
+        }
+        continue;
+      }
+
       const upFresh = upPrice > 0 && this.clobFeed.getPriceAge(market.upTokenId) < staleThresholdMs;
       const downFresh = downPrice > 0 && this.clobFeed.getPriceAge(market.downTokenId) < staleThresholdMs;
 

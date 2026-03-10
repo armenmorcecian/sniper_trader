@@ -111,7 +111,16 @@ async function main(): Promise<void> {
       for (const m of activeMarkets) {
         const msRemaining = new Date(m.endDate).getTime() - now;
         if (msRemaining > 0 && msRemaining <= SUBSCRIBE_WINDOW_MS) {
-          nearTokens.push(m.upTokenId, m.downTokenId);
+          // Skip subscribing to one-sided markets: if prices are known and one side
+          // is near-certain (< 2¢), these tokens will never enter the buy window.
+          // Brand-new markets (prices=0) always subscribe to get initial data.
+          const upPrice = clobFeed.getPrice(m.upTokenId);
+          const downPrice = clobFeed.getPrice(m.downTokenId);
+          const isBrandNew = upPrice === 0 && downPrice === 0;
+          const isOneSided = upPrice > 0 && downPrice > 0 && (upPrice < 0.02 || downPrice < 0.02);
+          if (!isOneSided || isBrandNew) {
+            nearTokens.push(m.upTokenId, m.downTokenId);
+          }
         }
       }
       // Also keep tokens for open positions (stop-loss needs prices)
