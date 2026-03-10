@@ -103,14 +103,15 @@ async function main(): Promise<void> {
     scanning = true;
 
     try {
-      // Only subscribe to markets within 10 min of expiry (saves proxy bandwidth)
-      const SUBSCRIBE_WINDOW_MS = 10 * 60 * 1000;
+      // Subscribe to ALL active market tokens immediately — keeps the WS alive and ensures
+      // book snapshots arrive well before the buy window opens. The 10-min filter caused
+      // idle WS timeouts (code=1006) that left CLOB prices stale during buy windows.
       const activeMarkets = await discovery.getActiveMarkets();
       const now = Date.now();
       const nearTokens: string[] = [];
       for (const m of activeMarkets) {
         const msRemaining = new Date(m.endDate).getTime() - now;
-        if (msRemaining > 0 && msRemaining <= SUBSCRIBE_WINDOW_MS) {
+        if (msRemaining > 0) {
           nearTokens.push(m.upTokenId, m.downTokenId);
         }
       }
