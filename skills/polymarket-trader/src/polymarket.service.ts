@@ -576,6 +576,27 @@ export class PolymarketService {
       withRetry(() => this.clobClient.getNegRisk(tokenId)),
     ]);
 
+    // For SELL orders the CLOB server validates against its cached on-chain balance.
+    // If tokens were acquired moments ago the cache is stale → HTTP 400 "not enough
+    // balance / allowance". Calling updateBalanceAllowance tells the server to
+    // re-fetch the wallet's conditional token balance from the chain before validating.
+    if (side === "SELL") {
+      try {
+        await withRetry(() =>
+          this.clobClient.updateBalanceAllowance({
+            asset_type: AssetType.CONDITIONAL,
+            token_id: tokenId,
+          }),
+        );
+      } catch (err) {
+        // Non-fatal — attempt the order anyway; it may still succeed if cache is fresh
+        console.warn(
+          "[polymarket] updateBalanceAllowance failed (non-fatal):",
+          err instanceof Error ? err.message : String(err),
+        );
+      }
+    }
+
     const orderResponse = await withRetry(() =>
       this.clobClient.createAndPostMarketOrder(
         {
