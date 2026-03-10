@@ -40,6 +40,7 @@ export class ClobFeed {
   private bookBids = new Map<string, Map<string, number>>();  // tokenId → (price_str → size)
   private bookAsks = new Map<string, Map<string, number>>();  // tokenId → (price_str → size)
   private _pendingSnapshotSince = new Map<string, number>(); // tokenId → when subscribe was sent
+  private _snapshotRetryCount = new Map<string, number>(); // tokenId → retry attempts so far
 
   constructor(proxyUrl?: string) {
     this._proxyUrl = proxyUrl;
@@ -112,15 +113,21 @@ export class ClobFeed {
         this.bookBids.delete(id);
         this.bookAsks.delete(id);
         this._pendingSnapshotSince.delete(id);
+        this._snapshotRetryCount.delete(id);
       }
     }
 
     this.subscribedTokens = newSet;
 
     if (toAdd.length > 0 && this.ws?.readyState === WebSocket.OPEN) {
+      // Reset retry count for freshly added tokens before subscribing
+      for (const id of toAdd) this._snapshotRetryCount.delete(id);
       this.subscribe(toAdd);
     } else if (toAdd.length > 0) {
-      for (const id of toAdd) this.pendingTokens.add(id);
+      for (const id of toAdd) {
+        this._snapshotRetryCount.delete(id);
+        this.pendingTokens.add(id);
+      }
     }
   }
 
@@ -266,17 +273,38 @@ export class ClobFeed {
             return;
           }
 
-          // Snapshot health check: re-subscribe tokens stuck waiting for initial book snapshot
+          // Snapshot health check: re-subscribe tokens stuck waiting for initial book snapshot.
+          // Cap at 3 retries — after that, the server has no snapshot to send (e.g., empty book
+          // on a newly started market). Prices will arrive via price_change/last_trade_price events
+          // once the market becomes active.
           const SNAPSHOT_TIMEOUT_MS = 30_000;
+          const MAX_SNAPSHOT_RETRIES = 3;
           const stuckTokens: string[] = [];
           for (const [tokenId, subscribedAt] of this._pendingSnapshotSince) {
-            if (this.subscribedTokens.has(tokenId) && now - subscribedAt > SNAPSHOT_TIMEOUT_MS) {
+            if (!this.subscribedTokens.has(tokenId)) {
+              this._pendingSnapshotSince.delete(tokenId);
+              this._snapshotRetryCount.delete(tokenId);
+              continue;
+            }
+            const retries = this._snapshotRetryCount.get(tokenId) ?? 0;
+            if (retries >= MAX_SNAPSHOT_RETRIES) {
+              // Give up — remove from pending so we stop logging/retrying
+              this._pendingSnapshotSince.delete(tokenId);
+              this._snapshotRetryCount.delete(tokenId);
+              console.log(`${LOG_PREFIX} Snapshot timeout: giving up on ${tokenId.slice(0, 12)} after ${retries} retries`);
+              continue;
+            }
+            if (now - subscribedAt > SNAPSHOT_TIMEOUT_MS) {
               stuckTokens.push(tokenId);
             }
           }
           if (stuckTokens.length > 0) {
+            for (const id of stuckTokens) {
+              this._snapshotRetryCount.set(id, (this._snapshotRetryCount.get(id) ?? 0) + 1);
+            }
+            const attempt = this._snapshotRetryCount.get(stuckTokens[0]) ?? 1;
             console.warn(
-              `${LOG_PREFIX} Re-subscribing ${stuckTokens.length} token(s) with missing initial snapshot (>30s wait)`,
+              `${LOG_PREFIX} Re-subscribing ${stuckTokens.length} token(s) with missing initial snapshot (attempt ${attempt}/${MAX_SNAPSHOT_RETRIES})`,
             );
             this.subscribe(stuckTokens);
           }
