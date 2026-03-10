@@ -428,6 +428,7 @@ export class ClobFeed {
       }
       this.bookBids.set(assetId, bids);
       this.bookAsks.set(assetId, asks);
+      this._pendingSnapshotSince.delete(assetId); // snapshot received — stop retrying even if book is empty
 
       const mid = this.computeMidpoint(assetId);
       if (mid !== null && !isNaN(mid) && mid > 0 && mid < 1) {
