@@ -417,35 +417,48 @@ export class PennyExecutor {
       if (now <= endMs + SETTLE_BUFFER_MS) continue;
 
       // Check actual resolution
-      let exitPrice: number;
+      // Timeout guard: if portfolio API is slow, skip this cycle and retry next scan
+      const PORTFOLIO_TIMEOUT_MS = 12_000;
+      const timeoutPromise = new Promise<null>((resolve) =>
+        setTimeout(() => resolve(null), PORTFOLIO_TIMEOUT_MS)
+      );
+      type PortfolioValue = Awaited<ReturnType<typeof this.service.getPortfolioValue>>;
+      let vitals: PortfolioValue | null;
       try {
-        const vitals = await this.service.getPortfolioValue();
-        const stillHeld = vitals.positions?.find(
-          (p) => p.conditionId === conditionId && p.size > 0,
-        );
-        if (stillHeld) {
-          // Tokens still in wallet = won, will be redeemed at $1.00
-          exitPrice = 1.00;
-        } else {
-          // Tokens gone — check if journal already has an exit (another service may have sold)
-          if (pos.tradeId) {
-            try {
-              const trades = queryTrades({ symbol: conditionId, skill: "polymarket" });
-              const buyTrade = trades.find((t) => t.id === pos.tradeId);
-              if (buyTrade?.exitPrice !== undefined) {
-                console.log(`${LOG_PREFIX} Already exited externally: ${conditionId.slice(0, 12)}`);
-                this.positions.delete(conditionId);
-                this.betConditionIds.delete(conditionId);
-                continue;
-              }
-            } catch { /* non-fatal — fall through to $0 */ }
-          }
-          exitPrice = 0.00;
-        }
+        vitals = await Promise.race([this.service.getPortfolioValue(), timeoutPromise]);
       } catch {
-        // Fallback: assume win (conservative — avoids false loss on API error)
+        vitals = null;
+      }
+
+      if (vitals === null) {
+        console.warn(
+          `${LOG_PREFIX} Portfolio check timed out for ${conditionId.slice(0, 12)} — will retry next cycle`,
+        );
+        continue; // leave position in Map, retry next 5s scan
+      }
+
+      let exitPrice: number;
+      const stillHeld = vitals.positions?.find(
+        (p) => p.conditionId === conditionId && p.size > 0,
+      );
+      if (stillHeld) {
+        // Tokens still in wallet = won, will be redeemed at $1.00
         exitPrice = 1.00;
-        console.warn(`${LOG_PREFIX} Could not verify resolution for ${conditionId.slice(0, 12)} — assuming win`);
+      } else {
+        // Tokens gone — check if journal already has an exit (another service may have sold)
+        if (pos.tradeId) {
+          try {
+            const trades = queryTrades({ symbol: conditionId, skill: "polymarket" });
+            const buyTrade = trades.find((t) => t.id === pos.tradeId);
+            if (buyTrade?.exitPrice !== undefined) {
+              console.log(`${LOG_PREFIX} Already exited externally: ${conditionId.slice(0, 12)}`);
+              this.positions.delete(conditionId);
+              this.betConditionIds.delete(conditionId);
+              continue;
+            }
+          } catch { /* non-fatal — fall through to $0 */ }
+        }
+        exitPrice = 0.00;
       }
 
       // Fire-and-forget redemption — don't block scan loop on slow proxy calls
