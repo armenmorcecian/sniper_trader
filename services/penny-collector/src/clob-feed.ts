@@ -353,7 +353,7 @@ export class ClobFeed {
     const eventType = String(event.event_type ?? "");
 
     // ── book: full order book snapshot (top-level asset_id, bids/asks arrays) ──
-    if (eventType === "book" && Array.isArray(event.bids) && Array.isArray(event.asks)) {
+    if ((eventType === "book" || !eventType) && Array.isArray(event.bids) && Array.isArray(event.asks)) {
       const assetId = String(event.asset_id ?? "");
       if (!assetId || !this.subscribedTokens.has(assetId)) return;
       this._bookEventCount++;
