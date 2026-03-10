@@ -1,6 +1,8 @@
 // ─── Expiry Scanner ─────────────────────────────────────────────────────────
 // Finds candle markets in the 30-60s expiry window with winning side at $0.90-0.95.
 // Uses CLOB WebSocket prices exclusively — skips markets with stale/missing WS data.
+// Gamma outcomePrices are NOT used as a fallback: they lag by minutes during final
+// expiry convergence and cause slippage rejects on every buy attempt.
 // Trusts the CLOB price as the directional signal (no Binance confirmation).
 
 import type { PennyCandidate, CandleMarket } from "./types";
@@ -38,9 +40,16 @@ export class ExpiryScanner {
       const downFresh = downPrice > 0 && this.clobFeed.getPriceAge(market.downTokenId) < CLOB_PRICE_MAX_AGE_MS;
 
       if (!upFresh || !downFresh) {
+        // CLOB price is stale — skip rather than use Gamma fallback.
+        // Gamma outcomePrices lag by minutes during final expiry convergence: if the
+        // winning side has moved to $0.99+ (CLOB goes quiet), Gamma still shows the
+        // old price (e.g. $0.975), causing slippage rejects on every buy attempt.
+        // CLOB reconnects within 5-10s; it's safer to miss one scan than buy at a
+        // stale price that will be rejected.
         console.log(
           `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
-          `stale CLOB (up=${upPrice.toFixed(3)} ${upFresh ? "fresh" : "STALE"}, down=${downPrice.toFixed(3)} ${downFresh ? "fresh" : "STALE"})`,
+          `stale CLOB (up=${upPrice.toFixed(3)} ${upFresh ? "fresh" : "STALE"}, ` +
+          `down=${downPrice.toFixed(3)} ${downFresh ? "fresh" : "STALE"}) — waiting for refresh`,
         );
         continue;
       }
