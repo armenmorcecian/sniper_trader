@@ -215,6 +215,15 @@ async function main(): Promise<void> {
   );
 }
 
+// Prevent crash from unhandled rejections in third-party library background promises
+// (Polymarket builder-relayer-client spawns internal polling timeouts after returning,
+//  and when the tx reverts on-chain those fire as unhandled rejections in Node 22)
+process.on("unhandledRejection", (reason: unknown) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  console.error(`${LOG_PREFIX} Unhandled promise rejection (non-fatal):`, msg);
+  // Do NOT call process.exit — crash-loop prevention
+});
+
 main().catch((err) => {
   console.error(`${LOG_PREFIX} Fatal error:`, err);
   process.exit(1);
