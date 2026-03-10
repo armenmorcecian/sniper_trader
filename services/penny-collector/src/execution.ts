@@ -69,10 +69,10 @@ export class PennyExecutor {
       return false;
     }
 
-    const amount = Math.min(
+    const amount = Math.floor(Math.min(
       this.config.maxBetAmount,
       balance * (1 - this.config.cashReservePct / 100),
-    );
+    ) * 100) / 100; // Round down to 2 decimals — CLOB rejects >2 decimal maker amounts
     if (amount < 0.50) {
       console.log(`${LOG_PREFIX} Insufficient balance: $${balance.toFixed(2)} (need > $0.50 after reserve)`);
       return false;
