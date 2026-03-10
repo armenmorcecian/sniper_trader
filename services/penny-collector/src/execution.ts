@@ -257,11 +257,10 @@ export class PennyExecutor {
       );
 
       const shares = pos.tokens ?? (pos.amount / pos.entryPrice);
-      const sellUsdcValue = shares * currentPrice;
-      const MIN_SELL_USDC = 5.0;
-      if (sellUsdcValue < MIN_SELL_USDC) {
+      const MIN_SHARE_PRICE = 0.50;
+      if (currentPrice < MIN_SHARE_PRICE) {
         console.warn(
-          `${LOG_PREFIX} STOP-LOSS: ${pos.market.asset}/${pos.market.timeframe} sell value $${sellUsdcValue.toFixed(2)} < $${MIN_SELL_USDC} minimum — holding to expiry`,
+          `${LOG_PREFIX} STOP-LOSS: ${pos.market.asset}/${pos.market.timeframe} price $${currentPrice.toFixed(3)} < $${MIN_SHARE_PRICE} floor — holding to expiry`,
         );
         pos.stopLossExhausted = true;
         continue;
