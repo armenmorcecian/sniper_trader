@@ -169,6 +169,7 @@ export class PennyExecutor {
         orderId: result.orderId,
         tokenId: candidate.tokenId,
         status: "open",
+        tokens: result.size,
       });
 
       this.betsThisHour.push(Date.now());
@@ -190,6 +191,7 @@ export class PennyExecutor {
   async checkStopLosses(clobFeed: ClobFeed): Promise<void> {
     for (const [conditionId, pos] of this.positions) {
       if (pos.status !== "open") continue;
+      if (pos.stopLossExhausted) continue;
 
       const currentPrice = clobFeed.getPrice(pos.tokenId);
       if (currentPrice <= 0) continue; // no price data yet
@@ -205,9 +207,19 @@ export class PennyExecutor {
         `@ $${pos.entryPrice.toFixed(3)} -> $${currentPrice.toFixed(3)} (${pnlPct.toFixed(1)}%)`,
       );
 
+      const shares = pos.tokens ?? (pos.amount / pos.entryPrice);
+      const sellUsdcValue = shares * currentPrice;
+      const MIN_SELL_USDC = 5.0;
+      if (sellUsdcValue < MIN_SELL_USDC) {
+        console.warn(
+          `${LOG_PREFIX} STOP-LOSS: ${pos.market.asset}/${pos.market.timeframe} sell value $${sellUsdcValue.toFixed(2)} < $${MIN_SELL_USDC} minimum — holding to expiry`,
+        );
+        pos.stopLossExhausted = true;
+        continue;
+      }
+
       // Sell via CLOB
       try {
-        const shares = pos.amount / pos.entryPrice;
         const sellResult = await this.service.fastMarketBuy({
           tokenId: pos.tokenId,
           amount: shares,
@@ -229,7 +241,9 @@ export class PennyExecutor {
 
         pos.status = "sold";
       } catch (err) {
-        console.error(`${LOG_PREFIX} Stop-loss sell failed:`, err instanceof Error ? err.message : String(err));
+        const msg = err instanceof Error ? err.message : String(err);
+        const body = (err as any)?.response?.data ? JSON.stringify((err as any).response.data) : '';
+        console.error(`${LOG_PREFIX} Stop-loss sell failed:`, msg, body || '');
       }
     }
   }

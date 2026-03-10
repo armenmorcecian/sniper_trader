@@ -121,6 +121,8 @@ export interface PennyPosition {
   orderId: string;
   tokenId: string;
   status: "open" | "sold";
+  tokens?: number;             // actual outcome token quantity received at fill
+  stopLossExhausted?: boolean; // true when stop-loss can't execute (value too small)
 }
 
 // Minimal AssetConfig for MarketDiscovery compatibility
