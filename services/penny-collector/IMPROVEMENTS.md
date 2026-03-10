@@ -21,16 +21,18 @@ between WS snapshot and live book remains — FOK can still fail if asks are pul
 our depth check and order submission.)*
 
 ### SQ-6: Tight slippage pre-check — skip entry when depth is stacked far above signal price
-**Observed:** BTC/15m/Up signal at $0.945 (40s remaining), filled at $0.980 — 3.5¢ slippage
-cutting expected profit from $0.275 to $0.10 (~64% reduction). The current ask-depth check
-passes because there IS ≥$5 depth below `maxWinningPrice=$0.98`, but all that depth sat at
-$0.98, not at the signal price. The market order swept through all the thin asks up to $0.98.
+**Observed (1):** BTC/15m/Up signal at $0.945 (40s remaining), filled at $0.980 — 3.5¢ slippage
+cutting expected profit from $0.275 to $0.10 (~64% reduction).
+**Observed (2):** BTC/15m/Up signal at $0.895 (64s remaining), filled at $0.980 — 8.5¢ slippage,
+80% profit reduction. `making=4.99996 taking=5.102 → fillPrice=0.980`. All ask depth was at
+$0.98; asks between $0.895 and $0.975 were essentially empty.
+The current ask-depth check passes because there IS ≥$5 depth below `maxWinningPrice=$0.98`,
+but all that depth sat at $0.98. The market order swept through all the thin asks up to $0.98.
 **Fix:** Tighten the depth check: verify ≥$5 ask-side depth at or below
-`winningPrice + SLIPPAGE_TOLERANCE` (e.g. 0.015 = 1.5¢). If depth only exists near
-`maxWinningPrice`, the expected fill will be far from signal price — skip rather than accept
-a predictably bad fill. This trades fewer entries for better average fill quality.
-**Trade-off:** Will skip some valid entries where depth is thin but concentrated just above
-signal price. Set tolerance generously (2¢) to avoid over-filtering.
+`winningPrice + 0.020` (2¢). If depth only exists near `maxWinningPrice`, the expected
+fill will be far from signal price — skip rather than accept a predictably bad fill.
+**Trade-off:** Will skip entries where depth is thin but concentrated just above signal price.
+*(Implemented via `fix/penny-sq6-tight-depth-check`)*
 
 ### SQ-5: Price stability filter — require ≥2 consecutive in-range scans before entry
 **Observed:** BTC/15m at 76s had Up=$0.89 (in range), but then dropped to $0.83 at 50s,
