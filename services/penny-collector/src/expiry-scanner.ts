@@ -6,6 +6,9 @@
 // Trusts the CLOB price as the directional signal (no Binance confirmation).
 // SQ-5: Price stability filter — requires ≥2 consecutive in-range scans before
 // emitting a candidate, avoiding wasted FOK calls on single-scan price spikes.
+// SQ-6: Tight slippage pre-check — verifies ask-side depth within 2¢ of signal price.
+// Prevents entries where all depth is stacked near maxWinningPrice ($0.98), forcing
+// the market order to sweep through thin asks and fill with 8-10¢ slippage.
 
 import type { PennyCandidate, CandleMarket } from "./types";
 import type { PennyConfig } from "./config";
@@ -111,12 +114,26 @@ export class ExpiryScanner {
         continue;
       }
 
-      // Ask-side depth check: ensure enough liquidity to fill our bet without FOK failure
+      // Ask-side depth check (broad): ensure enough liquidity to fill at all within range
       const askDepthUsd = this.clobFeed.getAskDepthUsd(tokenId, this.config.maxWinningPrice);
       if (askDepthUsd < this.config.maxBetAmount) {
         console.log(
           `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
           `insufficient ask depth: $${askDepthUsd.toFixed(2)} < $${this.config.maxBetAmount.toFixed(2)} bet`,
+        );
+        continue;
+      }
+
+      // Ask-side depth check (tight / SQ-6): skip if depth is concentrated far above signal
+      // price. A market order will sweep thin asks up to the nearest bulk depth level, causing
+      // 5-10¢ slippage that eliminates most of the expected profit.
+      const SLIPPAGE_TOLERANCE = 0.020; // 2¢ — fills within 2¢ of signal price are acceptable
+      const tightAskDepthUsd = this.clobFeed.getAskDepthUsd(tokenId, winningPrice + SLIPPAGE_TOLERANCE);
+      if (tightAskDepthUsd < this.config.maxBetAmount) {
+        console.log(
+          `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
+          `depth stacked above signal: only $${tightAskDepthUsd.toFixed(2)} within 2¢ of ` +
+          `$${winningPrice.toFixed(3)} (total depth $${askDepthUsd.toFixed(2)}) — likely fill near $${this.config.maxWinningPrice}`,
         );
         continue;
       }
