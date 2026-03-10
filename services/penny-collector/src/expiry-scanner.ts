@@ -9,6 +9,9 @@
 // SQ-6: Tight slippage pre-check — verifies ask-side depth within 2¢ of signal price.
 // Prevents entries where all depth is stacked near maxWinningPrice ($0.98), forcing
 // the market order to sweep through thin asks and fill with 8-10¢ slippage.
+// SQ-7: Price direction momentum filter — skip if second in-range scan shows price
+// declining >1¢ from first scan. A declining price within range suggests a thin-book
+// spike reverting toward $0.50, not genuine convergence momentum.
 
 import type { PennyCandidate, CandleMarket } from "./types";
 import type { PennyConfig } from "./config";
@@ -21,6 +24,7 @@ const CLOB_PRICE_NEAR_EXPIRY_AGE_MS = 300_000; // 5-min threshold when book goes
 
 export class ExpiryScanner {
   private _consecutiveInRange = new Map<string, number>();
+  private _firstScanPrice = new Map<string, number>();
   private _settledMarkets = new Set<string>();
 
   constructor(
@@ -77,6 +81,8 @@ export class ExpiryScanner {
         );
         this._consecutiveInRange.delete(market.upTokenId);
         this._consecutiveInRange.delete(market.downTokenId);
+        this._firstScanPrice.delete(market.upTokenId);
+        this._firstScanPrice.delete(market.downTokenId);
         continue;
       }
 
@@ -100,22 +106,42 @@ export class ExpiryScanner {
         );
         this._consecutiveInRange.delete(market.upTokenId);
         this._consecutiveInRange.delete(market.downTokenId);
+        this._firstScanPrice.delete(market.upTokenId);
+        this._firstScanPrice.delete(market.downTokenId);
         continue;
       }
 
       // Reset counter for the non-winning token
       const losingTokenId = winningSide === "Up" ? market.downTokenId : market.upTokenId;
       this._consecutiveInRange.delete(losingTokenId);
+      this._firstScanPrice.delete(losingTokenId);
 
       // Price stability check (SQ-5): require ≥2 consecutive in-range scans
       const inRangeCount = (this._consecutiveInRange.get(tokenId) ?? 0) + 1;
       this._consecutiveInRange.set(tokenId, inRangeCount);
       const REQUIRED_CONSECUTIVE_SCANS = 2;
       if (inRangeCount < REQUIRED_CONSECUTIVE_SCANS) {
+        // Scan 1: store current price as the baseline for SQ-7 comparison
+        this._firstScanPrice.set(tokenId, winningPrice);
         console.log(
           `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
           `price not stable yet: scan ${inRangeCount}/${REQUIRED_CONSECUTIVE_SCANS} in-range (${winningSide}@$${winningPrice.toFixed(3)})`,
         );
+        continue;
+      }
+
+      // Price direction momentum check (SQ-7): skip if price is declining >1¢ since scan 1
+      const firstScanPrice = this._firstScanPrice.get(tokenId);
+      if (firstScanPrice !== undefined && winningPrice < firstScanPrice - 0.010) {
+        const delta = winningPrice - firstScanPrice;
+        console.log(
+          `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
+          `SQ-7 momentum: price declining ($${firstScanPrice.toFixed(3)}→$${winningPrice.toFixed(3)}, ` +
+          `${(delta * 100).toFixed(1)}¢) — likely reverting spike`,
+        );
+        // Reset so the next scan starts fresh as scan 1 with a new firstScanPrice
+        this._consecutiveInRange.delete(tokenId);
+        this._firstScanPrice.delete(tokenId);
         continue;
       }
 
@@ -175,6 +201,7 @@ export class ExpiryScanner {
       // before the next retry, adding a natural ~6-10s cooldown for book replenishment.
       // Without this, a FOK failure causes immediate re-emit on the very next scan tick.
       this._consecutiveInRange.delete(tokenId);
+      this._firstScanPrice.delete(tokenId);
     }
 
     // Sort by highest expected profit (lowest price = most profit)
