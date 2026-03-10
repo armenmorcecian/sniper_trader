@@ -1,6 +1,7 @@
 // ─── Expiry Scanner ─────────────────────────────────────────────────────────
 // Finds candle markets in the 30-60s expiry window with winning side at $0.90-0.95.
-// Uses CLOB WebSocket prices exclusively — skips markets with stale/missing WS data.
+// Uses CLOB WebSocket prices as primary source; falls back to Gamma outcomePrices
+// when CLOB feed is stale (e.g. after a WebSocket reconnect gap).
 // Trusts the CLOB price as the directional signal (no Binance confirmation).
 
 import type { PennyCandidate, CandleMarket } from "./types";
@@ -38,9 +39,63 @@ export class ExpiryScanner {
       const downFresh = downPrice > 0 && this.clobFeed.getPriceAge(market.downTokenId) < CLOB_PRICE_MAX_AGE_MS;
 
       if (!upFresh || !downFresh) {
+        // CLOB feed is stale (WS reconnect gap) — try Gamma outcomePrices as fallback.
+        // outcomePrices is normalized to [Up, Down] by market-discovery.
+        const gammaUp = market.outcomePrices[0] ?? 0;
+        const gammaDown = market.outcomePrices[1] ?? 0;
+
+        if (gammaUp > 0 && gammaDown > 0) {
+          console.log(
+            `${LOG_PREFIX} [warn] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
+            `stale CLOB (up=${upPrice.toFixed(3)} ${upFresh ? "fresh" : "STALE"}, ` +
+            `down=${downPrice.toFixed(3)} ${downFresh ? "fresh" : "STALE"}); ` +
+            `using Gamma fallback (up=$${gammaUp.toFixed(3)}, down=$${gammaDown.toFixed(3)})`,
+          );
+          // Shadow the CLOB prices with Gamma prices for the rest of this iteration
+          const effectiveUpPrice = gammaUp;
+          const effectiveDownPrice = gammaDown;
+
+          let winningSide: "Up" | "Down";
+          let winningPrice: number;
+          let tokenId: string;
+
+          if (effectiveUpPrice >= this.config.minWinningPrice && effectiveUpPrice <= this.config.maxWinningPrice) {
+            winningSide = "Up";
+            winningPrice = effectiveUpPrice;
+            tokenId = market.upTokenId;
+          } else if (effectiveDownPrice >= this.config.minWinningPrice && effectiveDownPrice <= this.config.maxWinningPrice) {
+            winningSide = "Down";
+            winningPrice = effectiveDownPrice;
+            tokenId = market.downTokenId;
+          } else {
+            console.log(
+              `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
+              `Gamma price out of range (up=$${effectiveUpPrice.toFixed(3)}, down=$${effectiveDownPrice.toFixed(3)}, ` +
+              `window=$${this.config.minWinningPrice}-$${this.config.maxWinningPrice})`,
+            );
+            continue;
+          }
+
+          const spread = Math.abs(1 - effectiveUpPrice - effectiveDownPrice);
+          if (spread > this.config.maxSpread) {
+            console.log(
+              `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
+              `Gamma spread too wide: ${spread.toFixed(3)} > ${this.config.maxSpread}`,
+            );
+            continue;
+          }
+
+          if (market.liquidityNum < this.config.minLiquidity) continue;
+
+          const expectedProfit = (1.00 - winningPrice) * this.config.maxBetAmount;
+          candidates.push({ market, winningSide, winningPrice, secondsRemaining, tokenId, expectedProfit });
+          continue;
+        }
+
+        // Gamma price also unavailable — skip
         console.log(
           `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
-          `stale CLOB (up=${upPrice.toFixed(3)} ${upFresh ? "fresh" : "STALE"}, down=${downPrice.toFixed(3)} ${downFresh ? "fresh" : "STALE"})`,
+          `stale CLOB (up=${upPrice.toFixed(3)} ${upFresh ? "fresh" : "STALE"}, down=${downPrice.toFixed(3)} ${downFresh ? "fresh" : "STALE"}) and no Gamma fallback`,
         );
         continue;
       }
