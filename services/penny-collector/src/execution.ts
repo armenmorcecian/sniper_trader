@@ -192,6 +192,7 @@ export class PennyExecutor {
     for (const [conditionId, pos] of this.positions) {
       if (pos.status !== "open") continue;
       if (pos.stopLossExhausted) continue;
+      if (pos.stopLossUnexecutable) continue;
 
       const currentPrice = clobFeed.getPrice(pos.tokenId);
       if (currentPrice <= 0) continue; // no price data yet
@@ -243,7 +244,16 @@ export class PennyExecutor {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         const body = (err as any)?.response?.data ? JSON.stringify((err as any).response.data) : '';
-        console.error(`${LOG_PREFIX} Stop-loss sell failed:`, msg, body || '');
+        const isBalanceError = body.includes('not enough balance') || msg.includes('not enough balance');
+        if (isBalanceError) {
+          console.warn(
+            `${LOG_PREFIX} Stop-loss sell blocked: CLOB reports "not enough balance / allowance" — ` +
+            `tokens from builder-relayer fill are not in CTF Exchange proxy. Holding to expiry.`,
+          );
+          pos.stopLossUnexecutable = true;
+        } else {
+          console.error(`${LOG_PREFIX} Stop-loss sell failed:`, msg, body || '');
+        }
       }
     }
   }

@@ -121,8 +121,9 @@ export interface PennyPosition {
   orderId: string;
   tokenId: string;
   status: "open" | "sold";
-  tokens?: number;             // actual outcome token quantity received at fill
-  stopLossExhausted?: boolean; // true when stop-loss can't execute (value too small)
+  tokens?: number;                // actual outcome token quantity received at fill
+  stopLossExhausted?: boolean;    // true when stop-loss can't execute (value too small)
+  stopLossUnexecutable?: boolean; // true when CLOB rejects sell (builder-relayer tokens not in CTF Exchange)
 }
 
 // Minimal AssetConfig for MarketDiscovery compatibility
