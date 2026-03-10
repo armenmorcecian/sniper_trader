@@ -254,20 +254,64 @@ export class PennyExecutor {
           // Tokens still in wallet = won, will be redeemed at $1.00
           exitPrice = 1.00;
         } else {
-          // Tokens gone — check if journal already has an exit (another service may have sold)
-          if (pos.tradeId) {
+          // Tokens not in portfolio positions list.
+          // This can mean: (a) market resolved and positions API dropped the entry,
+          // (b) tokens were sold externally, or (c) redemption already happened.
+          // Try redemption to distinguish win vs loss — don't assume $0 yet.
+          if (this.service.redeemWinningTokens) {
             try {
-              const trades = queryTrades({ symbol: conditionId, skill: "polymarket" });
-              const buyTrade = trades.find((t) => t.id === pos.tradeId);
-              if (buyTrade?.exitPrice !== undefined) {
-                console.log(`${LOG_PREFIX} Already exited externally: ${conditionId.slice(0, 12)}`);
-                this.positions.delete(conditionId);
-                this.betConditionIds.delete(conditionId);
+              const redeemed = await this.service.redeemWinningTokens(conditionId);
+              if (redeemed) {
+                console.log(`${LOG_PREFIX} Redeemed winning tokens (was missing from portfolio) for ${conditionId.slice(0, 12)}`);
+                exitPrice = 1.00;
+              } else {
+                // Redemption returned false — check if it's an externally-exited position
+                if (pos.tradeId) {
+                  try {
+                    const trades = queryTrades({ symbol: conditionId, skill: "polymarket" });
+                    const buyTrade = trades.find((t) => t.id === pos.tradeId);
+                    if (buyTrade?.exitPrice !== undefined) {
+                      console.log(`${LOG_PREFIX} Already exited externally: ${conditionId.slice(0, 12)}`);
+                      this.positions.delete(conditionId);
+                      this.betConditionIds.delete(conditionId);
+                      continue;
+                    }
+                  } catch { /* non-fatal */ }
+                }
+                // Redemption returned false + not sold externally = lost
+                console.log(`${LOG_PREFIX} Not redeemable + tokens gone: ${conditionId.slice(0, 12)} — recording as loss`);
+                exitPrice = 0.00;
+              }
+            } catch (redeemErr: unknown) {
+              const msg = redeemErr instanceof Error ? redeemErr.message : String(redeemErr);
+              if (msg.includes("not received yet") || msg.includes("not resolved")) {
+                // Oracle hasn't resolved yet — but tokens are gone from portfolio.
+                // This is unusual. Could be an API lag. Retry next cycle.
+                console.log(`${LOG_PREFIX} Oracle not resolved but tokens missing for ${conditionId.slice(0, 12)} — will retry`);
                 continue;
               }
-            } catch { /* non-fatal — fall through to $0 */ }
+              // Other error (tokens already redeemed by us in a previous cycle, or network error)
+              // Check journal for existing exit
+              if (pos.tradeId) {
+                try {
+                  const trades = queryTrades({ symbol: conditionId, skill: "polymarket" });
+                  const buyTrade = trades.find((t) => t.id === pos.tradeId);
+                  if (buyTrade?.exitPrice !== undefined) {
+                    console.log(`${LOG_PREFIX} Already exited externally: ${conditionId.slice(0, 12)}`);
+                    this.positions.delete(conditionId);
+                    this.betConditionIds.delete(conditionId);
+                    continue;
+                  }
+                } catch { /* non-fatal */ }
+              }
+              // Unknown error — assume loss rather than false win
+              console.warn(`${LOG_PREFIX} Redemption error for missing position ${conditionId.slice(0, 12)}: ${msg} — recording as loss`);
+              exitPrice = 0.00;
+            }
+          } else {
+            // No redeemWinningTokens method — fall back to $0 (legacy behavior)
+            exitPrice = 0.00;
           }
-          exitPrice = 0.00;
         }
       } catch {
         // Fallback: assume win (conservative — avoids false loss on API error)
