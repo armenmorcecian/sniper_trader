@@ -127,12 +127,12 @@ export class ExpiryScanner {
       // Ask-side depth check (tight / SQ-6): skip if depth is concentrated far above signal
       // price. A market order will sweep thin asks up to the nearest bulk depth level, causing
       // 5-10¢ slippage that eliminates most of the expected profit.
-      const SLIPPAGE_TOLERANCE = 0.020; // 2¢ — fills within 2¢ of signal price are acceptable
+      const SLIPPAGE_TOLERANCE = 0.050; // 5¢ — fills within 5¢ of signal price are acceptable
       const tightAskDepthUsd = this.clobFeed.getAskDepthUsd(tokenId, winningPrice + SLIPPAGE_TOLERANCE);
       if (tightAskDepthUsd < this.config.maxBetAmount) {
         console.log(
           `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
-          `depth stacked above signal: only $${tightAskDepthUsd.toFixed(2)} within 2¢ of ` +
+          `depth stacked above signal: only $${tightAskDepthUsd.toFixed(2)} within 5¢ of ` +
           `$${winningPrice.toFixed(3)} (total depth $${askDepthUsd.toFixed(2)}) — likely fill near $${this.config.maxWinningPrice}`,
         );
         continue;
