@@ -4,6 +4,8 @@
 // Gamma outcomePrices are NOT used as a fallback: they lag by minutes during final
 // expiry convergence and cause slippage rejects on every buy attempt.
 // Trusts the CLOB price as the directional signal (no Binance confirmation).
+// SQ-5: Price stability filter — requires ≥2 consecutive in-range scans before
+// emitting a candidate, avoiding wasted FOK calls on single-scan price spikes.
 
 import type { PennyCandidate, CandleMarket } from "./types";
 import type { PennyConfig } from "./config";
@@ -15,6 +17,8 @@ const CLOB_PRICE_MAX_AGE_MS = 30_000;        // normal stale threshold
 const CLOB_PRICE_NEAR_EXPIRY_AGE_MS = 300_000; // 5-min threshold when book goes quiet at convergence
 
 export class ExpiryScanner {
+  private _consecutiveInRange = new Map<string, number>();
+
   constructor(
     private readonly discovery: MarketDiscovery,
     private readonly config: PennyConfig,
@@ -53,6 +57,8 @@ export class ExpiryScanner {
           `stale CLOB (up=${upPrice.toFixed(3)} ${upFresh ? "fresh" : "STALE"}, ` +
           `down=${downPrice.toFixed(3)} ${downFresh ? "fresh" : "STALE"}) — waiting for refresh`,
         );
+        this._consecutiveInRange.delete(market.upTokenId);
+        this._consecutiveInRange.delete(market.downTokenId);
         continue;
       }
 
@@ -73,6 +79,24 @@ export class ExpiryScanner {
           `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
           `price out of range (up=$${upPrice.toFixed(3)}, down=$${downPrice.toFixed(3)}, ` +
           `window=$${this.config.minWinningPrice}-$${this.config.maxWinningPrice})`,
+        );
+        this._consecutiveInRange.delete(market.upTokenId);
+        this._consecutiveInRange.delete(market.downTokenId);
+        continue;
+      }
+
+      // Reset counter for the non-winning token
+      const losingTokenId = winningSide === "Up" ? market.downTokenId : market.upTokenId;
+      this._consecutiveInRange.delete(losingTokenId);
+
+      // Price stability check (SQ-5): require ≥2 consecutive in-range scans
+      const inRangeCount = (this._consecutiveInRange.get(tokenId) ?? 0) + 1;
+      this._consecutiveInRange.set(tokenId, inRangeCount);
+      const REQUIRED_CONSECUTIVE_SCANS = 2;
+      if (inRangeCount < REQUIRED_CONSECUTIVE_SCANS) {
+        console.log(
+          `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
+          `price not stable yet: scan ${inRangeCount}/${REQUIRED_CONSECUTIVE_SCANS} in-range (${winningSide}@$${winningPrice.toFixed(3)})`,
         );
         continue;
       }
