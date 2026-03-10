@@ -190,12 +190,12 @@ export class PennyExecutor {
       const priceAge = clobFeed.getPriceAge(pos.tokenId);
       if (priceAge > 30_000) continue; // stale price (>30s)
 
-      const pnlPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
-      if (pnlPct >= -this.config.stopLossPct) continue; // not triggered
+      if (currentPrice >= this.config.stopLossPrice) continue; // not triggered
 
+      const pnlPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
       console.log(
         `${LOG_PREFIX} STOP-LOSS: ${pos.market.asset} ${pos.market.timeframe} ${pos.side} ` +
-        `@ $${pos.entryPrice.toFixed(3)} -> $${currentPrice.toFixed(3)} (${pnlPct.toFixed(1)}%)`,
+        `@ $${pos.entryPrice.toFixed(3)} -> $${currentPrice.toFixed(3)} (${pnlPct.toFixed(1)}%) [floor: $${this.config.stopLossPrice.toFixed(2)}]`,
       );
 
       // Sell via CLOB

@@ -26,7 +26,7 @@ export interface PennyConfig {
   cashReservePct: number;
 
   // Risk
-  stopLossPct: number;
+  stopLossPrice: number;
 
   // Scanning
   scanIntervalMs: number;
@@ -91,7 +91,7 @@ export function loadConfig(): PennyConfig {
     maxSpread: Number(process.env.PENNY_MAX_SPREAD) || 0.08,
     minLiquidity: Number(process.env.PENNY_MIN_LIQUIDITY) || 3000,
 
-    stopLossPct: Number(process.env.PENNY_STOP_LOSS_PCT) || 15,
+    stopLossPrice: Number(process.env.PENNY_STOP_LOSS_PRICE) || 0.60,
 
     maxBetAmount: Number(process.env.PENNY_MAX_BET) || 10.0,
     maxConcurrentPositions: Number(process.env.PENNY_MAX_CONCURRENT) || 3,
