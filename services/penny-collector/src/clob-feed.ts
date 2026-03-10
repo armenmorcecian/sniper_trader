@@ -41,6 +41,7 @@ export class ClobFeed {
   private bookAsks = new Map<string, Map<string, number>>();  // tokenId → (price_str → size)
   private _pendingSnapshotSince = new Map<string, number>(); // tokenId → when subscribe was sent
   private _snapshotRetryCount = new Map<string, number>(); // tokenId → retry attempts so far
+  private _tokenExpiry = new Map<string, number>(); // tokenId → market expiry timestamp (ms) — set by index.ts
 
   constructor(proxyUrl?: string) {
     this._proxyUrl = proxyUrl;
@@ -74,6 +75,15 @@ export class ClobFeed {
       }
     }
     return totalUsd;
+  }
+
+  /**
+   * Register the expiry timestamp for a token (used by CF-2: avoid force-reconnecting
+   * when all snapshot-failed tokens are far from their buy window).
+   * Call alongside setTokens() for each newly-added near-expiry token.
+   */
+  setTokenExpiry(tokenId: string, expiryMs: number): void {
+    this._tokenExpiry.set(tokenId, expiryMs);
   }
 
   /** Register callback for price updates */
@@ -280,7 +290,7 @@ export class ClobFeed {
           const SNAPSHOT_TIMEOUT_MS = 30_000;
           const MAX_SNAPSHOT_RETRIES = 3;
           const stuckTokens: string[] = [];
-          let gaveUp = false;
+          const gaveUpTokenIds: string[] = [];
           for (const [tokenId, subscribedAt] of this._pendingSnapshotSince) {
             if (!this.subscribedTokens.has(tokenId)) {
               this._pendingSnapshotSince.delete(tokenId);
@@ -293,7 +303,7 @@ export class ClobFeed {
               this._pendingSnapshotSince.delete(tokenId);
               this._snapshotRetryCount.delete(tokenId);
               console.log(`${LOG_PREFIX} Snapshot timeout: giving up on ${tokenId.slice(0, 12)} after ${retries} retries`);
-              gaveUp = true;
+              gaveUpTokenIds.push(tokenId);
               continue;
             }
             if (now - subscribedAt > SNAPSHOT_TIMEOUT_MS) {
@@ -309,12 +319,24 @@ export class ClobFeed {
               `${LOG_PREFIX} Re-subscribing ${stuckTokens.length} token(s) with missing initial snapshot (attempt ${attempt}/${MAX_SNAPSHOT_RETRIES})`,
             );
             this.subscribe(stuckTokens);
-          } else if (gaveUp && this._pendingSnapshotSince.size === 0 && this.subscribedTokens.size > 0) {
-            // All snapshot retries exhausted and no recovery is pending — reconnect now
-            // rather than waiting 30-90s for the zombie timer to fire.
-            console.warn(`${LOG_PREFIX} All snapshot retries exhausted — force reconnecting now`);
-            this.ws!.terminate();
-            return;
+          } else if (gaveUpTokenIds.length > 0 && this._pendingSnapshotSince.size === 0 && this.subscribedTokens.size > 0) {
+            // All snapshot retries exhausted. CF-2: only force-reconnect if at least one
+            // failed token is near its buy window (≤6min from expiry). Thin-book tokens
+            // far from expiry (e.g. 4h tokens at 22min) will never get snapshots — don't
+            // disrupt existing subscriptions for markets that ARE approaching their window.
+            const BUY_WINDOW_THRESHOLD_MS = 360_000; // 6 min = 2× maxSecondsBeforeExpiry
+            const hasUrgentToken = gaveUpTokenIds.some((id) => {
+              const expiry = this._tokenExpiry.get(id);
+              return expiry === undefined || (expiry - now) <= BUY_WINDOW_THRESHOLD_MS;
+            });
+            if (hasUrgentToken) {
+              console.warn(`${LOG_PREFIX} All snapshot retries exhausted — force reconnecting now`);
+              this.ws!.terminate();
+              return;
+            }
+            console.log(
+              `${LOG_PREFIX} Snapshot timeout: ${gaveUpTokenIds.length} token(s) gave up but all >6min from expiry — skipping force-reconnect`,
+            );
           }
         }
       }, PING_INTERVAL_MS);

@@ -112,6 +112,10 @@ async function main(): Promise<void> {
         const msRemaining = new Date(m.endDate).getTime() - now;
         if (msRemaining > 0 && msRemaining <= SUBSCRIBE_WINDOW_MS) {
           nearTokens.push(m.upTokenId, m.downTokenId);
+          // CF-2: register expiry so clob-feed skips force-reconnect for far-from-window tokens
+          const expiryMs = new Date(m.endDate).getTime();
+          clobFeed.setTokenExpiry(m.upTokenId, expiryMs);
+          clobFeed.setTokenExpiry(m.downTokenId, expiryMs);
         }
       }
       // Also keep tokens for open positions (stop-loss needs prices)
