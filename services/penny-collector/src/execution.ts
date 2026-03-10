@@ -184,6 +184,11 @@ export class PennyExecutor {
     for (const [conditionId, pos] of this.positions) {
       if (pos.status !== "open") continue;
 
+      // Skip stop-loss after market expiry — CLOB prices are stale post-expiry
+      // Let checkResolutions() handle the final outcome instead
+      const endMs = new Date(pos.market.endDate).getTime();
+      if (Date.now() >= endMs) continue;
+
       const currentPrice = clobFeed.getPrice(pos.tokenId);
       if (currentPrice <= 0) continue; // no price data yet
 
