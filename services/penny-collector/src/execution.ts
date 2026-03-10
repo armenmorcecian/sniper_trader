@@ -1,8 +1,9 @@
 // ─── Penny Executor ─────────────────────────────────────────────────────────
 // Market buy (FOK) near-expiry contracts, hold to resolution at $1.00.
 
+import axios from "axios";
 import { recordTrade, updateTradeExit, recordEquitySnapshot, queryTrades } from "quant-core";
-import type { PennyCandidate, PennyPosition, IPolymarketService } from "./types";
+import type { CandleMarket, PennyCandidate, PennyPosition, IPolymarketService } from "./types";
 import type { PennyConfig } from "./config";
 import type { ClobFeed } from "./clob-feed";
 
@@ -34,6 +35,143 @@ export class PennyExecutor {
       }
     } catch (err) {
       console.warn(`${LOG_PREFIX} Could not hydrate positions (non-fatal):`, err instanceof Error ? err.message : String(err));
+    }
+
+    await this.hydratePositionsFromJournal();
+  }
+
+  /** Reconstruct in-flight positions from the trade journal after a restart */
+  private async hydratePositionsFromJournal(): Promise<void> {
+    let trades;
+    try {
+      trades = queryTrades({ skill: "polymarket" });
+    } catch (err) {
+      console.warn(`${LOG_PREFIX} Could not query journal for position hydration (non-fatal):`, err instanceof Error ? err.message : String(err));
+      return;
+    }
+
+    const unresolvedBuys = trades.filter(
+      (t) => t.tool === "penny-collector:buy" && t.status === "filled" && t.exitPrice == null,
+    );
+
+    let hydrated = 0;
+
+    for (const trade of unresolvedBuys) {
+      const conditionId = trade.conditionId ?? trade.symbol ?? "";
+      if (!conditionId) continue;
+
+      // Don't overwrite positions that were registered post-restart (from this session)
+      if (this.positions.has(conditionId)) continue;
+
+      const meta = trade.metadata ?? {};
+
+      if (meta.tokenId && meta.endDate) {
+        // New trades: full metadata available
+        const endDate = meta.endDate as string;
+        const endMs = new Date(endDate).getTime();
+
+        if (Date.now() > endMs + 2 * 3_600_000) continue; // beyond 2h retry window
+
+        const tokenId = meta.tokenId as string;
+        const position: PennyPosition = {
+          conditionId,
+          market: {
+            conditionId,
+            question: "",
+            slug: "",
+            asset: ((meta.asset as string) || "BTC") as CandleMarket["asset"],
+            timeframe: ((meta.timeframe as string) || "15m") as CandleMarket["timeframe"],
+            startDate: "",
+            endDate,
+            clobTokenIds: [],
+            outcomePrices: [],
+            upTokenId: "",
+            downTokenId: "",
+            volumeNum: 0,
+            liquidityNum: 0,
+          },
+          side: (trade.outcome as "Up" | "Down") ?? "Up",
+          entryPrice: trade.price ?? 0,
+          entryTime: trade.timestamp ? new Date(trade.timestamp).getTime() : Date.now(),
+          amount: trade.amount ?? 0,
+          tradeId: trade.id ?? 0,
+          orderId: "",
+          tokenId,
+          status: "open",
+        };
+
+        this.positions.set(conditionId, position);
+        this.betConditionIds.add(conditionId);
+        hydrated++;
+      } else {
+        // Old trades without tokenId/endDate: fall back to Gamma API
+        try {
+          const url = `${this.config.gammaHost}/markets?condition_ids=${conditionId}`;
+          const resp = await axios.get<Array<{
+            conditionId?: string;
+            condition_id?: string;
+            endDate?: string;
+            end_date?: string;
+            clobTokenIds?: string[];
+            clob_token_ids?: string[];
+          }>>(url, { timeout: 5000 });
+
+          const markets = resp.data;
+          if (!markets || markets.length === 0) continue;
+
+          const mkt = markets[0];
+          const endDate = mkt.endDate ?? mkt.end_date ?? "";
+          if (!endDate) continue;
+
+          const endMs = new Date(endDate).getTime();
+          if (Date.now() > endMs + 2 * 3_600_000) continue; // beyond 2h retry window
+
+          const clobTokenIds: string[] = mkt.clobTokenIds ?? mkt.clob_token_ids ?? [];
+          const upTokenId = clobTokenIds[0] ?? "";
+          const downTokenId = clobTokenIds[1] ?? "";
+          const tokenId = trade.outcome === "Down" ? downTokenId : upTokenId;
+
+          const position: PennyPosition = {
+            conditionId,
+            market: {
+              conditionId,
+              question: "",
+              slug: "",
+              asset: ((meta.asset as string) || "BTC") as CandleMarket["asset"],
+              timeframe: ((meta.timeframe as string) || "15m") as CandleMarket["timeframe"],
+              startDate: "",
+              endDate,
+              clobTokenIds,
+              outcomePrices: [],
+              upTokenId,
+              downTokenId,
+              volumeNum: 0,
+              liquidityNum: 0,
+            },
+            side: (trade.outcome as "Up" | "Down") ?? "Up",
+            entryPrice: trade.price ?? 0,
+            entryTime: trade.timestamp ? new Date(trade.timestamp).getTime() : Date.now(),
+            amount: trade.amount ?? 0,
+            tradeId: trade.id ?? 0,
+            orderId: "",
+            tokenId,
+            status: "open",
+          };
+
+          this.positions.set(conditionId, position);
+          this.betConditionIds.add(conditionId);
+          hydrated++;
+        } catch (err) {
+          console.warn(
+            `${LOG_PREFIX} Could not hydrate position ${conditionId.slice(0, 12)} from Gamma (non-fatal):`,
+            err instanceof Error ? err.message : String(err),
+          );
+        }
+      }
+    }
+
+    if (hydrated > 0) {
+      console.log(`${LOG_PREFIX} Hydrated ${hydrated} in-flight position(s) from journal`);
     }
   }
 
@@ -144,6 +282,8 @@ export class PennyExecutor {
             timeframe: candidate.market.timeframe,
             secondsRemaining: candidate.secondsRemaining,
             expectedProfit: candidate.expectedProfit,
+            tokenId: candidate.tokenId,
+            endDate: candidate.market.endDate,
           },
         });
       } catch (err) {
