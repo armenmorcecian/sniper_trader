@@ -142,13 +142,18 @@ export class ExpiryScanner {
       // Ask-side depth check (tight / SQ-6): skip if depth is concentrated far above signal
       // price. A market order will sweep thin asks up to the nearest bulk depth level, causing
       // 5-10¢ slippage that eliminates most of the expected profit.
+      // IMPORTANT: cap tightWindow at maxWinningPrice — when winningPrice is already close to
+      // max (e.g. $0.95), tolerance would extend to $1.00, allowing depth at $0.99 to pass.
+      // But a fill at $0.99 exceeds maxWinningPrice and gets slippage-rejected anyway.
       const SLIPPAGE_TOLERANCE = 0.050; // 5¢ — fills within 5¢ of signal price are acceptable
-      const tightAskDepthUsd = this.clobFeed.getAskDepthUsd(tokenId, winningPrice + SLIPPAGE_TOLERANCE);
+      const tightWindow = Math.min(winningPrice + SLIPPAGE_TOLERANCE, this.config.maxWinningPrice);
+      const tightAskDepthUsd = this.clobFeed.getAskDepthUsd(tokenId, tightWindow);
       if (tightAskDepthUsd < this.config.maxBetAmount) {
         console.log(
           `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
-          `depth stacked above signal: only $${tightAskDepthUsd.toFixed(2)} within 5¢ of ` +
-          `$${winningPrice.toFixed(3)} (total depth $${askDepthUsd.toFixed(2)}) — likely fill near $${this.config.maxWinningPrice}`,
+          `depth stacked above signal: only $${tightAskDepthUsd.toFixed(2)} within ` +
+          `$${(tightWindow - winningPrice).toFixed(2)} of $${winningPrice.toFixed(3)} ` +
+          `(total depth $${askDepthUsd.toFixed(2)}) — likely fill near $${this.config.maxWinningPrice}`,
         );
         continue;
       }
