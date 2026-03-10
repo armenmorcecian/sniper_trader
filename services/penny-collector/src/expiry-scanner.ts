@@ -87,6 +87,16 @@ export class ExpiryScanner {
         continue;
       }
 
+      // Ask-side depth check: ensure enough liquidity to fill our bet without FOK failure
+      const askDepthUsd = this.clobFeed.getAskDepthUsd(tokenId, this.config.maxWinningPrice);
+      if (askDepthUsd < this.config.maxBetAmount) {
+        console.log(
+          `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
+          `insufficient ask depth: $${askDepthUsd.toFixed(2)} < $${this.config.maxBetAmount.toFixed(2)} bet`,
+        );
+        continue;
+      }
+
       // Liquidity check (still from Gamma — no WS equivalent)
       if (market.liquidityNum < this.config.minLiquidity) continue;
 

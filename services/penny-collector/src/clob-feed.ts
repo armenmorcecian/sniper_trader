@@ -57,6 +57,23 @@ export class ClobFeed {
     return last ? Date.now() - last : Infinity;
   }
 
+  /**
+   * Get total USD value of ask-side liquidity at or below maxPrice for a token.
+   * Returns 0 if no book data available.
+   */
+  getAskDepthUsd(tokenId: string, maxPrice: number): number {
+    const asks = this.bookAsks.get(tokenId);
+    if (!asks) return 0;
+    let totalUsd = 0;
+    for (const [priceStr, size] of asks) {
+      const price = parseFloat(priceStr);
+      if (!isNaN(price) && price <= maxPrice && size > 0) {
+        totalUsd += price * size;
+      }
+    }
+    return totalUsd;
+  }
+
   /** Register callback for price updates */
   onPrice(callback: PriceCallback): void {
     this.priceCallbacks.push(callback);
