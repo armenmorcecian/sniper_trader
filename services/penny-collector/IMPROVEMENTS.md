@@ -87,6 +87,29 @@ P&L — the inability to stop-loss prevented crystallizing losses that subsequen
 relayer-routed stop-losses could eliminate this beneficial "hold to expiry" behaviour, so
 consider RM-5 (final-window time-gate) as a prerequisite before implementing RM-4.
 
+### RM-6: Raise PENNY_MAX_CONCURRENT to 2 — allow simultaneous 15m + 1h positions
+**Observed:** While holding BTC/1h/Down@$0.960 (bought at 150s remaining), the scanner
+found 3 valid BTC/15m/Up candidates: $0.91 (99s), $0.96 (89s), $0.97 (77s). All blocked
+by `PENNY_MAX_CONCURRENT=1`. The 15m/Up market settled one-sided at up=$0.985 (all three
+would have won). The 1h/Down simultaneously settled at down=$0.985 (both markets won in
+the same expiry window).
+**Why independent:** 15m and 1h markets have different strikes and expiry times. When both
+are simultaneously in the $0.88-$0.98 range, BTC is between the two strikes — the 1h/Down
+means BTC is below the 1h strike, and the 15m/Up means BTC is above the 15m strike. These
+bets are often *negatively correlated* (BTC rising hurts 1h/Down but helps 15m/Up and vice
+versa), making simultaneous holding a natural hedge rather than doubled exposure.
+**Estimated P&L impact (this window):** At balance ~$0.94 remaining after 1h/Down buy,
+second bet would have been ~$0.80 at $0.91 fill → profit ~$0.08. At higher balances
+(e.g. $20 total), second bet would be ~$4 → ~$0.36 additional profit per window.
+**Fix:** Set `PENNY_MAX_CONCURRENT=2` in `.env`. Code already supports it (default=3).
+No code change needed. Verify risk by monitoring 2-position windows for a week before
+raising further.
+**Trade-off:** Second position is always cash-limited (remaining balance after first bet
+deducted). If balance is low (~$5), second bet may be <$1. If both positions lose
+simultaneously (BTC makes a large move against both strikes), total loss doubles. But given
+the near-expiry short window (30-180s) and negative correlation structure, simultaneous
+losses are less likely than in same-direction bets.
+
 ### RM-5: Stop-loss final-window time-gate — suppress within 60s of expiry ⭐ FIXED
 **Observed (3 consecutive windows):**
 - 66s: Up=$0.785 (-18.2%) → stop-loss triggered → FOK failed → resolved Up +4.2%
@@ -148,6 +171,20 @@ Log "thin book, holding to expiry" with seconds remaining for diagnosis.
 **Trade-off:** If FOK fails early in the hold (e.g., 120s remaining), we won't retry even if
 the book replenishes. In practice, near-expiry books don't replenish quickly enough.
 *(Implemented via `fix/penny-stoploss-fok-exhausted`)*
+
+### EX-5: Log rejection reason when executeBuy returns false silently
+**Observed:** Scanner logs `Found 1 candidate(s)...BTC/15m/Up@$0.91(99s)` but the next
+scan log shows `candidates=1 positions=1` with no BUY attempt. The rejection is silent —
+no log explains whether the candidate was blocked by: concurrent limit, dedup, rate limit,
+cash check, or slippage reject. When debugging missed entries, it's impossible to tell
+which guard fired.
+**Fix:** In `executeBuy()`, add a brief `console.log` at each early-return guard:
+- Dedup: `"[skip] ${conditionId.slice(0,12)} — already in portfolio (dedup)"`
+- Concurrent: `"[skip] ${market.asset}/${timeframe}/${side} — concurrent limit (${size}/${max})"`
+- Rate: `"[rate-limit] ${betsThisHour}/${maxBetsPerHour} bets/hr — skipping"`
+- Cash: already logged
+This makes the per-scan decision visible in logs without adding noise (each guard fires at
+most once per candidate).
 
 ### EX-4: Sell at CLOB when price drops below entry in final 10s
 If a held position's CLOB price drops to < $0.50 with < 10s remaining (market about to
