@@ -1,7 +1,11 @@
 // ─── Expiry Scanner ─────────────────────────────────────────────────────────
 // Finds candle markets in the 30-60s expiry window with winning side at $0.90-0.95.
 // Uses CLOB WebSocket prices exclusively — skips markets with stale/missing WS data.
+// Gamma outcomePrices are NOT used as a fallback: they lag by minutes during final
+// expiry convergence and cause slippage rejects on every buy attempt.
 // Trusts the CLOB price as the directional signal (no Binance confirmation).
+// SQ-5: Price stability filter — requires ≥2 consecutive in-range scans before
+// emitting a candidate, avoiding wasted FOK calls on single-scan price spikes.
 
 import type { PennyCandidate, CandleMarket } from "./types";
 import type { PennyConfig } from "./config";
@@ -9,9 +13,13 @@ import type { MarketDiscovery } from "./market-discovery";
 import type { ClobFeed } from "./clob-feed";
 
 const LOG_PREFIX = "[expiry-scanner]";
-const CLOB_PRICE_MAX_AGE_MS = 30_000; // consider WS price stale after 30s
+const CLOB_PRICE_MAX_AGE_MS = 30_000;        // normal stale threshold
+const CLOB_PRICE_NEAR_EXPIRY_AGE_MS = 300_000; // 5-min threshold when book goes quiet at convergence
 
 export class ExpiryScanner {
+  private _consecutiveInRange = new Map<string, number>();
+  private _firstScanPrice = new Map<string, number>();
+
   constructor(
     private readonly discovery: MarketDiscovery,
     private readonly config: PennyConfig,
@@ -31,17 +39,27 @@ export class ExpiryScanner {
       if (secondsRemaining < this.config.minSecondsBeforeExpiry ||
           secondsRemaining > this.config.maxSecondsBeforeExpiry) continue;
 
-      // CLOB WS prices only — skip if stale or missing
+      // CLOB WS prices only — skip if stale or missing.
+      // Near expiry, the order book goes quiet as the market converges to 0/1
+      // and trading activity dries up. Use an extended stale threshold in that
+      // case: a price received within the last 5 minutes is still a valid
+      // directional signal even if no new book updates have arrived.
       const upPrice = this.clobFeed.getPrice(market.upTokenId);
       const downPrice = this.clobFeed.getPrice(market.downTokenId);
-      const upFresh = upPrice > 0 && this.clobFeed.getPriceAge(market.upTokenId) < CLOB_PRICE_MAX_AGE_MS;
-      const downFresh = downPrice > 0 && this.clobFeed.getPriceAge(market.downTokenId) < CLOB_PRICE_MAX_AGE_MS;
+      const staleThresholdMs = secondsRemaining < this.config.maxSecondsBeforeExpiry
+        ? CLOB_PRICE_NEAR_EXPIRY_AGE_MS
+        : CLOB_PRICE_MAX_AGE_MS;
+      const upFresh = upPrice > 0 && this.clobFeed.getPriceAge(market.upTokenId) < staleThresholdMs;
+      const downFresh = downPrice > 0 && this.clobFeed.getPriceAge(market.downTokenId) < staleThresholdMs;
 
       if (!upFresh || !downFresh) {
         console.log(
           `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
-          `stale CLOB (up=${upPrice.toFixed(3)} ${upFresh ? "fresh" : "STALE"}, down=${downPrice.toFixed(3)} ${downFresh ? "fresh" : "STALE"})`,
+          `stale CLOB (up=${upPrice.toFixed(3)} ${upFresh ? "fresh" : "STALE"}, ` +
+          `down=${downPrice.toFixed(3)} ${downFresh ? "fresh" : "STALE"}) — waiting for refresh`,
         );
+        this._consecutiveInRange.delete(market.upTokenId);
+        this._consecutiveInRange.delete(market.downTokenId);
         continue;
       }
 
@@ -63,6 +81,27 @@ export class ExpiryScanner {
           `price out of range (up=$${upPrice.toFixed(3)}, down=$${downPrice.toFixed(3)}, ` +
           `window=$${this.config.minWinningPrice}-$${this.config.maxWinningPrice})`,
         );
+        this._consecutiveInRange.delete(market.upTokenId);
+        this._consecutiveInRange.delete(market.downTokenId);
+        continue;
+      }
+
+      // Reset counter for the non-winning token
+      const losingTokenId = winningSide === "Up" ? market.downTokenId : market.upTokenId;
+      this._consecutiveInRange.delete(losingTokenId);
+
+      // Price stability check (SQ-5): require ≥2 consecutive in-range scans
+      const inRangeCount = (this._consecutiveInRange.get(tokenId) ?? 0) + 1;
+      this._consecutiveInRange.set(tokenId, inRangeCount);
+      if (!this._firstScanPrice.has(tokenId)) {
+        this._firstScanPrice.set(tokenId, winningPrice);
+      }
+      const REQUIRED_CONSECUTIVE_SCANS = 2;
+      if (inRangeCount < REQUIRED_CONSECUTIVE_SCANS) {
+        console.log(
+          `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
+          `price not stable yet: scan ${inRangeCount}/${REQUIRED_CONSECUTIVE_SCANS} in-range (${winningSide}@$${winningPrice.toFixed(3)})`,
+        );
         continue;
       }
 
@@ -72,6 +111,16 @@ export class ExpiryScanner {
         console.log(
           `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
           `spread too wide: ${spread.toFixed(3)} > ${this.config.maxSpread}`,
+        );
+        continue;
+      }
+
+      // Ask-side depth check: ensure enough liquidity to fill our bet without FOK failure
+      const askDepthUsd = this.clobFeed.getAskDepthUsd(tokenId, this.config.maxWinningPrice);
+      if (askDepthUsd < this.config.maxBetAmount) {
+        console.log(
+          `${LOG_PREFIX} [skip] ${market.asset}/${market.timeframe} ${secondsRemaining.toFixed(0)}s — ` +
+          `insufficient ask depth: $${askDepthUsd.toFixed(2)} < $${this.config.maxBetAmount.toFixed(2)} bet`,
         );
         continue;
       }
@@ -89,6 +138,19 @@ export class ExpiryScanner {
         tokenId,
         expectedProfit,
       });
+
+      // Near-expiry fast retry: when <90s remaining, keep stability counter so a
+      // FOK failure retries immediately on the next 5s scan instead of waiting
+      // 10s for the stability cooldown. Near expiry the book rarely replenishes
+      // during a 10s pause — rapid retries maximise fill chances in the thin book.
+      // With >90s remaining, the normal cooldown applies (book has time to replenish).
+      if (secondsRemaining > 90) {
+        this._consecutiveInRange.delete(tokenId);
+        this._firstScanPrice.delete(tokenId);
+      } else {
+        // Keep stability but update baseline price for SQ-7 momentum check
+        this._firstScanPrice.set(tokenId, winningPrice);
+      }
     }
 
     // Sort by highest expected profit (lowest price = most profit)
