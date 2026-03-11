@@ -481,6 +481,30 @@ buy window. After N=3 consecutive stale scans (15s), call `clobFeed.forceReconne
 A reconnect at 150s remaining still leaves 150s of buy window after reconnect (snapshots arrive in ~5s).
 **Priority:** Medium — CF-3 should prevent this scenario in normal operation. CF-4 is insurance.
 
+### CF-5: Proactive reconnect on new token IDs — eliminate 150s dead time at candle rollover ⭐ FIXED
+**Observed (cycles 24–25):** CF-3 confirmed firing on EVERY new 15m candle rollover. The 150s
+delay (3×30s retries + 30s soft-reconnect) leaves ~2m55s of dead time before prices flow. At 9m
+remaining (when new tokens subscribed), CF-3 doesn't deliver prices until 7m05s — we lose the
+first 2m55s of the 9-minute monitoring window. In a volatile final 3m, this deprives the scanner
+of trend context that could distinguish directional moves from noise.
+**Root cause:** Same as CF-3 — CLOB server only delivers book snapshots for the FIRST subscribe
+batch after a connection opens. Tokens added later on an existing connection never receive
+snapshots. CF-3 waits for retries to exhaust (90s) then fires a 30s delayed reconnect (30s).
+**Fix:** In `setTokens()`, when new token IDs are detected on a connection older than 30s,
+immediately schedule a 5s proactive reconnect. This ensures new tokens are included in the
+next connection's initial subscribe batch, getting snapshots within seconds of rollover.
+- New field: `_connectionOpenTime = 0` (set in open handler)
+- New field: `_proactiveReconnectTimer` (cleaned up in destroy/open handler)
+- Guard: `connectionAge > 30_000 && !_proactiveReconnectTimer && !_softReconnectTimer`
+- Effect: new tokens get prices in ~5-10s instead of ~150s after rollover
+**Dead time comparison:**
+- Before CF-5: 9m→7m05s = 2m55s dead at each candle rollover
+- After CF-5: 9m→8m55s = 5s dead at each candle rollover
+**Additional benefit (cycle 25):** Simultaneous 15m+1h expiry detected (both at 9m49s) — 4 tokens
+subscribed at once. CF-5 would fire for all 4 simultaneously, giving 3 extra minutes of data for
+both markets before their shared buy window opens.
+*(Deployed to workspace + fix/penny-cf5-proactive-reconnect branch pending review)*
+
 ### SQ-8: Skip expiry-scanner stability check for already-deduped conditionId
 **Observed:** After buying BTC/15m/Up at 65s remaining, the expiry-scanner continued running
 SQ-5 stability checks on the same market (scan 1/2 at 50s, candidate at 42s). The subsequent
