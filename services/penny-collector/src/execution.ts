@@ -142,6 +142,8 @@ export class PennyExecutor {
             source: "penny-collector",
             asset: candidate.market.asset,
             timeframe: candidate.market.timeframe,
+            tokenId: candidate.tokenId,
+            endDate: candidate.market.endDate,
             secondsRemaining: candidate.secondsRemaining,
             expectedProfit: candidate.expectedProfit,
           },

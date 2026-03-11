@@ -266,6 +266,13 @@ was redeemed successfully via relayer on restart → +$0.05 (+1.0%) profit recor
 Workspace `init()` still only populates `betConditionIds` (dedup), NOT `this.positions`. Confirmed
 impact (cycle 16): BTC/15m/Up@$0.970 ($5 bet, winner, interrupted by SIGHUP in cycle 15) survived
 the setpriv restart as a dedup entry only — tokens stuck unredeemed on-chain. Merge + deploy ASAP.
+**⚠️ PREREQUISITE BUG IN HYDRATION BRANCH (cycle 17):** `fix/penny-journal-hydration` reads
+`meta.tokenId` and `meta.endDate` in its hydration loop, but `recordTrade()` never writes these
+fields — metadata only stored `source/asset/timeframe/secondsRemaining/expectedProfit`. The
+`if (!meta.endDate) continue` guard causes EVERY trade to be skipped; journalCount always stays 0.
+**Fix (IN-12):** Added `tokenId` and `endDate` to `recordTrade()` metadata in `execution.ts`.
+Deployed to workspace + `fix/penny-journal-metadata-fix` branch. Must be deployed BEFORE or with
+`fix/penny-journal-hydration` for that branch to function correctly.
 
 ### IN-9: SIGHUP restart loop — graceful shutdown on su session termination ⭐ FIXED
 **Observed:** "Session terminated, killing shell..." appears every 3-10 minutes for ALL services
@@ -357,6 +364,22 @@ the $3000 minimum. Override via env: `PENNY_MIN_LIQUIDITY_4H=500`, `PENNY_MIN_LI
 prices. 4h candle resolves on a longer window (more stable oracle) which offsets this.
 **Estimated uplift:** 4h windows excluded in ~60% of scans → could add 2-3 bets/hour for 4h contracts.
 *(Implemented via fix/penny-md3-liquidity-thresholds)*
+
+### IN-13: recordTrade metadata missing tokenId/endDate — breaks journal hydration ⭐ FIXED
+**Observed (cycle 17):** `fix/penny-journal-hydration` branch's `init()` journal hydration reads
+`meta.tokenId` and `meta.endDate` from journal entries, but `recordTrade()` in `execution.ts`
+never wrote these fields. The guard `if (!meta.endDate || typeof meta.endDate !== "string") continue;`
+causes every trade to be skipped — `journalCount` stays 0, making the journal hydration a silent no-op.
+Even after deploying `fix/penny-journal-hydration`, orphaned winning tokens would NEVER be recovered
+because the prerequisite data was never stored.
+**Fix:** Added `tokenId: candidate.tokenId` and `endDate: candidate.market.endDate` to the
+`metadata` object in the `recordTrade()` call inside `executeBuy()`. Two fields, zero risk.
+All future buy fills will have the fields needed for journal hydration to reconstruct positions.
+**Note:** Existing journal entries (before this fix) still lack these fields — no retroactive fix
+possible. But the BTC/15m/Up@$0.970 orphaned token can still be recovered via the portfolio API
+path in `init()` (it's in betConditionIds). Only NEW positions bought after this fix will be
+recoverable from the journal.
+*(Deployed to workspace + fix/penny-journal-metadata-fix branch, cycle 17)*
 
 ### SQ-8: Skip expiry-scanner stability check for already-deduped conditionId
 **Observed:** After buying BTC/15m/Up at 65s remaining, the expiry-scanner continued running
