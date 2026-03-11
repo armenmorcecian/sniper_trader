@@ -429,7 +429,27 @@ endpoint (`GET /orderbook/:tokenId`) once to seed the price cache. Avoids a full
 **Verification (cycle 21):** Previous service had `emitted=129491` frozen for 38+ min (zero new
 price events). After fix deployment + restart: `emitted` went 0→443→24820 in the first 2 minutes.
 Active price data flowing; scanner now has valid CLOB prices for entry decisions.
+**Confirmed miss (cycle 22):** Cycle 22 logs captured the OLD service (pre-fix) missing an ENTIRE
+15m buy window: scans from 177s→36s remaining ALL logged `stale CLOB (up=0.000 STALE)`. Every
+scan in the window was skipped. With a 38-min session, 2-3 full buy windows were lost to this bug.
 *(Deployed to workspace, fix/penny-cf3-soft-reconnect branch pending review)*
+
+### CF-4: Stale-CLOB emergency reconnect when prices dead during buy window
+**Observed (cycle 22):** Pre-CF-3 service showed `[skip] BTC/15m 177s — stale CLOB (up=0.000 STALE)`
+for EVERY scan from 177s down to 36s remaining. The entire buy window was lost. CF-3 prevents this
+for the normal subscription cycle, but CF-4 is a defensive backstop: if somehow prices are still 0
+when the buy window opens (CF-3 reconnect failed, connection refused, race condition), the scanner
+should trigger an emergency reconnect rather than silently skipping every scan.
+**Fix:** In `ExpiryScanner.findCandidates()`, track consecutive stale scans per market during the
+buy window. After N=3 consecutive stale scans (15s), call `clobFeed.forceReconnect()`:
+- Add `_staleInWindowCount = new Map<string, number>()` to ExpiryScanner
+- When `priceAge > 30_000` inside the buy window (< 180s), increment the counter
+- At count === 3: log `[emergency] BTC/15m — stale for 3 scans in buy window, forcing CLOB reconnect`
+  and call `clobFeed.forceReconnect()` (new public wrapper for `ws.terminate()`)
+- Reset counter on any non-stale scan or market expiry
+**Trade-off:** Adds a reconnect mid-buy-window (~1s gap). Acceptable — better than 100% miss.
+A reconnect at 150s remaining still leaves 150s of buy window after reconnect (snapshots arrive in ~5s).
+**Priority:** Medium — CF-3 should prevent this scenario in normal operation. CF-4 is insurance.
 
 ### SQ-8: Skip expiry-scanner stability check for already-deduped conditionId
 **Observed:** After buying BTC/15m/Up at 65s remaining, the expiry-scanner continued running
