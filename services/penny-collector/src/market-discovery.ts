@@ -52,14 +52,21 @@ export class MarketDiscovery {
   private readonly enabledAssets: Asset[];
   private readonly timeframesByAsset: Map<Asset, Set<Timeframe>>;
   private readonly minLiquidity: number;
+  private readonly minLiquidityByTimeframe: Partial<Record<Timeframe, number>>;
   private cache: CandleMarket[] = [];
   private lastPoll = 0;
   private readonly cacheTtlMs = 5_000; // 5s (CLOB WS is primary price source)
 
-  constructor(gammaHost: string, assetConfigs: Map<Asset, AssetConfig>, minLiquidity: number = 5000) {
+  constructor(
+    gammaHost: string,
+    assetConfigs: Map<Asset, AssetConfig>,
+    minLiquidity: number = 5000,
+    minLiquidityByTimeframe: Partial<Record<Timeframe, number>> = {},
+  ) {
     this.gammaHost = gammaHost;
     this.enabledAssets = [...assetConfigs.keys()];
     this.minLiquidity = minLiquidity;
+    this.minLiquidityByTimeframe = minLiquidityByTimeframe;
     this.timeframesByAsset = new Map();
     for (const [asset, cfg] of assetConfigs) {
       this.timeframesByAsset.set(asset, new Set(cfg.targetTimeframes));
@@ -236,10 +243,11 @@ export class MarketDiscovery {
       const volumeNum = Number(m.volumeNum) || 0;
       const liquidityNum = Number(m.liquidityNum) || 0;
 
-      // Filter out illiquid markets
-      if (liquidityNum < this.minLiquidity) {
+      // Filter out illiquid markets (per-timeframe threshold overrides global minimum)
+      const minLiq = this.minLiquidityByTimeframe[timeframe] ?? this.minLiquidity;
+      if (liquidityNum < minLiq) {
         console.log(
-          `${LOG_PREFIX} Skip ${matchedAsset} ${timeframe} — low liquidity: $${liquidityNum.toFixed(0)} < $${this.minLiquidity} (vol=$${volumeNum.toFixed(0)})`,
+          `${LOG_PREFIX} Skip ${matchedAsset} ${timeframe} — low liquidity: $${liquidityNum.toFixed(0)} < $${minLiq} (vol=$${volumeNum.toFixed(0)})`,
         );
         continue;
       }

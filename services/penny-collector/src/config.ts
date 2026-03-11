@@ -18,6 +18,7 @@ export interface PennyConfig {
   maxWinningPrice: number;
   maxSpread: number;
   minLiquidity: number;
+  minLiquidityByTimeframe: Partial<Record<Timeframe, number>>;
 
   // Position sizing
   maxBetAmount: number;
@@ -90,6 +91,11 @@ export function loadConfig(): PennyConfig {
     maxWinningPrice: Number(process.env.PENNY_MAX_WINNING_PRICE) || 0.97,
     maxSpread: Number(process.env.PENNY_MAX_SPREAD) || 0.08,
     minLiquidity: Number(process.env.PENNY_MIN_LIQUIDITY) || 3000,
+    minLiquidityByTimeframe: {
+      "4h": Number(process.env.PENNY_MIN_LIQUIDITY_4H) || 500,
+      ...(process.env.PENNY_MIN_LIQUIDITY_15M ? { "15m": Number(process.env.PENNY_MIN_LIQUIDITY_15M) } : {}),
+      ...(process.env.PENNY_MIN_LIQUIDITY_1H ? { "1h": Number(process.env.PENNY_MIN_LIQUIDITY_1H) } : {}),
+    },
 
     stopLossPct: Number(process.env.PENNY_STOP_LOSS_PCT) || 15,
 

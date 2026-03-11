@@ -50,7 +50,7 @@ async function main(): Promise<void> {
   const { PolymarketService } = require("../../../skills/polymarket-trader/dist/polymarket.service");
   const service: IPolymarketService = new PolymarketService(config.polymarketConfig);
 
-  const discovery = new MarketDiscovery(config.gammaHost, config.assetConfigs, config.minLiquidity);
+  const discovery = new MarketDiscovery(config.gammaHost, config.assetConfigs, config.minLiquidity, config.minLiquidityByTimeframe);
 
   // CLOB WebSocket for real-time price verification (prevents stale Gamma prices)
   // Connect directly (no proxy) — WS is read-only data, geo-blocking only applies to order placement
