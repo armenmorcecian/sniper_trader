@@ -12,6 +12,26 @@ Binance spot price comparison (already has a `binance-feed.ts` file) could filte
 cases where the CLOB book is thin and the midpoint is temporarily distorted. Only enter
 if CLOB directional signal matches Binance spot trend.
 
+### SQ-10: Near-miss logging for entry threshold calibration
+**Observed (cycle 23):** First window with live prices (CF-3 fix active). BTC/15m tracked through
+full buy window. Peak Up price was $0.745 at 95s remaining — 0.135 below the $0.88 threshold.
+Market reversed to $0.515 at 85s, then oscillated 0.49-0.60 to expiry. Window never triggered.
+**Problem:** No log currently records "near misses" — windows where the peak price was ≥$0.80
+but fell short of the $0.88 entry threshold. Over many windows this data would:
+1. Quantify how often the threshold prevents entry (opportunity cost vs false-positive protection)
+2. Show the distribution of "how close we came" (median near-miss gap)
+3. Enable data-driven threshold refinement (e.g., if peak price regularly reaches $0.85 and
+   converges, lowering threshold to $0.85 adds bets without significantly increasing loss rate)
+**Fix:** In ExpiryScanner, track the peak CLOB price for each side per window. On window exit
+(when market expires or tokens change), if peak price was ≥$0.80 but < $0.88, log:
+  `[near-miss] BTC/15m — peak Up=$0.745 at 95s remaining, never reached $0.88 entry floor`
+Also record to journal/SQLite for statistical analysis.
+**Threshold context (cycle 23 data):** At $0.745 with 95s remaining, expected value IF resolved
+Up would be $0.255/share gain. But the price dropped 0.23 in 10s → the current $0.88 floor is
+*correct* for this case. The near-miss log would accumulate evidence to validate or adjust this.
+**Priority:** Low — observability/analytics improvement, no direct P&L impact without additional
+analysis. Useful for future threshold tuning once 50+ windows of data are collected.
+
 ### SQ-2: Order book depth filter
 Before entering, check that the ask side has enough size at the winning price to fill
 our bet without significant slippage. Currently we only check total liquidity from Gamma.
