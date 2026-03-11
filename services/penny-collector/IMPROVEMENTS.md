@@ -503,6 +503,11 @@ next connection's initial subscribe batch, getting snapshots within seconds of r
 **Additional benefit (cycle 25):** Simultaneous 15m+1h expiry detected (both at 9m49s) — 4 tokens
 subscribed at once. CF-5 would fire for all 4 simultaneously, giving 3 extra minutes of data for
 both markets before their shared buy window opens.
+**Live verification (cycle 26):** CF-5 fired: "New token(s) on 392s-old connection — proactive reconnect
+in 5s" → WS closed → fresh connection → "Subscribed to 2 token(s)" → emitted: 13,760→45,716→90,796
+(+77K in 2 minutes). Subsequent 15m buy window at 175s remaining showed live prices ($0.185/$0.815)
+with zero stale-CLOB warnings — a clean buy window scan with valid price data. Previously (before
+CF-3/CF-5), this window would have shown all scans as "stale CLOB (up=0.000 STALE)".
 *(Deployed to workspace + fix/penny-cf5-proactive-reconnect branch pending review)*
 
 ### SQ-8: Skip expiry-scanner stability check for already-deduped conditionId
