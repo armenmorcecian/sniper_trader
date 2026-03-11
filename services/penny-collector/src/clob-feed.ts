@@ -43,6 +43,8 @@ export class ClobFeed {
   private _snapshotRetryCount = new Map<string, number>(); // tokenId → retry attempts so far
   private _tokenExpiry = new Map<string, number>(); // tokenId → market expiry timestamp (ms) — set by index.ts
   private _softReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private _connectionOpenTime = 0; // timestamp when current WS connection opened
+  private _proactiveReconnectTimer: ReturnType<typeof setTimeout> | null = null; // CF-5: reconnect on new token IDs
 
   constructor(proxyUrl?: string) {
     this._proxyUrl = proxyUrl;
@@ -134,6 +136,24 @@ export class ClobFeed {
       // Reset retry count for freshly added tokens before subscribing
       for (const id of toAdd) this._snapshotRetryCount.delete(id);
       this.subscribe(toAdd);
+      // CF-5: on long-running connections, new token subscriptions rarely receive book
+      // snapshots from the server — only the initial subscribe batch after open() is
+      // guaranteed a snapshot delivery. Proactively reconnect in 5s so these new tokens
+      // are included in the first subscribe batch on a fresh connection.
+      const connectionAge = Date.now() - this._connectionOpenTime;
+      if (connectionAge > 30_000 && !this._proactiveReconnectTimer && !this._softReconnectTimer) {
+        const addedCount = toAdd.length;
+        console.log(
+          `${LOG_PREFIX} New token(s) on ${Math.round(connectionAge / 1000)}s-old connection — proactive reconnect in 5s`,
+        );
+        this._proactiveReconnectTimer = setTimeout(() => {
+          this._proactiveReconnectTimer = null;
+          if (!this.destroyed && this.ws?.readyState === WebSocket.OPEN) {
+            console.log(`${LOG_PREFIX} Proactive reconnect: fresh connection for ${addedCount} new token(s)`);
+            this.ws.terminate();
+          }
+        }, 5_000);
+      }
     } else if (toAdd.length > 0) {
       for (const id of toAdd) {
         this._snapshotRetryCount.delete(id);
@@ -152,6 +172,10 @@ export class ClobFeed {
     if (this._softReconnectTimer) {
       clearTimeout(this._softReconnectTimer);
       this._softReconnectTimer = null;
+    }
+    if (this._proactiveReconnectTimer) {
+      clearTimeout(this._proactiveReconnectTimer);
+      this._proactiveReconnectTimer = null;
     }
     if (this.pingInterval) clearInterval(this.pingInterval);
     if (this.ws) {
@@ -249,12 +273,17 @@ export class ClobFeed {
       this.reconnectDelay = 1000;
       this._messageCount = 0;
       this._rawLogCount = 0;
-      // Cancel any pending soft reconnect — fresh connection already established
+      this._lastMessageTime = Date.now();
+      this._connectionOpenTime = Date.now();
+      // Cancel any pending reconnect timers — fresh connection already established
       if (this._softReconnectTimer) {
         clearTimeout(this._softReconnectTimer);
         this._softReconnectTimer = null;
       }
-      this._lastMessageTime = Date.now();
+      if (this._proactiveReconnectTimer) {
+        clearTimeout(this._proactiveReconnectTimer);
+        this._proactiveReconnectTimer = null;
+      }
       this._lastPongTime = Date.now();
 
       this._pendingSnapshotSince.clear(); // will be repopulated by subscribe() below
