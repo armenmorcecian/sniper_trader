@@ -321,25 +321,22 @@ After fix: service reliably reaches "Running. Scan every 5s." within 15s of star
 when portfolio API is slow.
 *(Implemented via `fix/penny-init-portfolio-timeout`)*
 
-### IN-11: Remove `su` from Docker entrypoint to eliminate SIGHUP restarts entirely ⭐ FIXED
+### IN-11: Remove `su` from Docker entrypoint to eliminate SIGHUP restarts entirely ⭐ FIXED (v2: setpriv)
 **Observed:** Even with the SIGHUP handler (IN-9), the container restarts every 3-10 minutes due to
 `su -s /bin/sh node -c '...'` creating a PAM session that terminates and sends SIGHUP. Each restart
 causes a fresh CLOB reconnect, re-subscription, and snapshot fetch (~5-10s gap). Observed impact:
-SIGHUP at 5m27s remaining → service restarted at 3m20s, missing ~2 minutes of pre-window monitoring
-(the 200s→180s stability count period). In this window prices stayed out of range so no entry was
-missed, but if BTC converged to $0.88+ in the 5m-3m20s window, the SQ-5 stability counter would
-reset on restart, potentially delaying entry by one extra 5s tick.
-**Fix:** Replace `exec su -s /bin/sh node -c 'exec npx tsx src/index.ts'` with
-`exec runuser -u node -- npx tsx src/index.ts` in `deploy/docker-compose.yml`.
-`runuser` (from util-linux, available in Debian Bookworm at `/usr/sbin/runuser`) drops privileges
-without opening a PAM login session, so no SIGHUP is ever sent. Confirmed available in `openclaw:local`
-image. Applied to all 5 service entrypoints (quant-signals, risk-monitor, btc-scalper, penny-collector,
-early-scalper, copycat-wallet).
-**Verification:** penny-collector ran 6+ minutes continuously after switching to `runuser` with
-zero "Session terminated, killing shell..." messages. Previous record was ~5 minutes between SIGHUPs.
-**Impact:** All services now run with uninterrupted uptime, eliminating periodic CLOB reconnects
-and startup latency from PAM session restarts.
-*(Implemented via `fix/penny-su-runuser-entrypoint`)*
+SIGHUP at 5m27s remaining → service restarted at 3m20s, missing ~2 minutes of pre-window monitoring.
+**v1 attempted (runuser):** Replaced `su` with `exec runuser -u node -- npx tsx src/index.ts`.
+FAILED — `runuser` on Debian Bookworm ALSO opens a PAM session: `/etc/pam.d/runuser` includes
+`pam_keyinit.so revoke` and `pam_unix.so`, which print "Session terminated, killing shell..." and
+can send SIGHUP via keyring revocation. Restarts continued.
+**v2 fix (setpriv):** Replace with `exec setpriv --reuid=1000 --regid=1000 --init-groups -- npx tsx src/index.ts`.
+`setpriv` (util-linux 2.38.1, available in container) drops privileges by calling setuid/setgid
+directly — NO PAM session opened, NO SIGHUP ever sent. node UID=1000, GID=1000 (official node image).
+Applied to all 6 service entrypoints (openclaw/docker-compose.yml + deploy/docker-compose.yml).
+**Verification:** Container shows `(healthy)` immediately after switch to setpriv. No "Session
+terminated" in logs. Awaiting 15+ minute clean run to confirm no spontaneous restarts.
+*(Implemented via fix/penny-md3-liquidity-thresholds commit 2)*
 
 ### MD-3: 4h market liquidity threshold excludes thinly-traded but valid markets ⭐ FIXED
 **Observed:** `Skip BTC 4h — low liquidity: $420 < $3000 (vol=$31816)`,
