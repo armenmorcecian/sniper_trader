@@ -381,6 +381,26 @@ path in `init()` (it's in betConditionIds). Only NEW positions bought after this
 recoverable from the journal.
 *(Deployed to workspace + fix/penny-journal-metadata-fix branch, cycle 17)*
 
+### SQ-9: Trending-market idle telemetry — alert when consecutive one-sided windows exceed threshold
+**Observed (cycles 16-18):** 5+ consecutive 15m/1h windows all one-sided (alternating BTC strong
+UP then DOWN). Every window entered the buy window at $0.986/$0.990 or $0.015/$0.985 — never
+in the $0.88-$0.98 entry range. The service correctly skips all via `[settled]` but logs nothing
+to indicate HOW LONG it's been idle. An operator watching logs sees only silence between market-
+discovery lines and cannot distinguish "idle due to trending market" from "bug preventing entries".
+**Observed pattern:** BTC in strong directional trend → 15m candles one-sided ~85% of the time,
+1h candles one-sided ~70% of the time. Entry windows only open during choppy/range-bound sessions.
+**Fix:** Track a rolling counter of consecutive one-sided windows per timeframe. After N=3
+consecutive one-sided windows, log a summary and send one Telegram alert:
+  `"[penny-collector] Trending idle: last 3x BTC/15m all one-sided (UP). Next candle ends at HH:MM"`
+Reset counter when any candidate is found OR when the direction changes (UP→DOWN or vice versa).
+Telegram alert: fire once at N=3, then re-fire every N=10 to avoid spam.
+**Implementation:** Add `_oneSidedStreak = new Map<string, {count: number, direction: string}>()`
+to ExpiryScanner. Increment on `[settled]` detection, reset on candidate emission, log/alert at
+threshold. Direction = "UP" if up>0.5, "DOWN" if down>0.5.
+**Estimated value:** Reduces operator confusion during trending markets. Also useful for post-hoc
+analysis: correlate idle streaks with BTC trend data to estimate what conditions maximize entries.
+**Low priority** — no P&L impact, pure observability.
+
 ### SQ-8: Skip expiry-scanner stability check for already-deduped conditionId
 **Observed:** After buying BTC/15m/Up at 65s remaining, the expiry-scanner continued running
 SQ-5 stability checks on the same market (scan 1/2 at 50s, candidate at 42s). The subsequent
