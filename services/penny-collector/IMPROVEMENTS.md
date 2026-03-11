@@ -452,6 +452,16 @@ Active price data flowing; scanner now has valid CLOB prices for entry decisions
 **Confirmed miss (cycle 22):** Cycle 22 logs captured the OLD service (pre-fix) missing an ENTIRE
 15m buy window: scans from 177s→36s remaining ALL logged `stale CLOB (up=0.000 STALE)`. Every
 scan in the window was skipped. With a 38-min session, 2-3 full buy windows were lost to this bug.
+**Live verification (cycle 24, 2nd candle):** CF-3 fired again on brand-new 15m token IDs after
+candle rollover. Exact sequence: 3 snapshot retries (9m56s / 8m51s / 7m46s remaining) → exhausted
+at 7m22s remaining → CF-2 "all >6min — soft reconnect in 30s" → timer fired at 6m40s remaining
+→ WS closed (code=1006) → fresh connection → RAW book snapshots immediate (best_bid:0.92) →
+`emitted` rose 259,148→286,528 (+27,380) over 5 min before buy window opened. Market settled at
+177s (up=$0.01, down=$0.99) → correct one-sided skip. No missed bet. Fix working as designed.
+**Structural pattern confirmed:** CF-3 fires on EVERY new 15m candle rollover. New token IDs
+always fail snapshot on the existing WS connection. Delay profile: subscribe at ~10m remaining
+→ 3 retries × 30s → CF-3 fires at ~7m30s → reconnect at ~7m00s → fresh data from ~6m40s to 3m.
+Leaves 3.7 minutes of live price data before the buy window — adequate margin.
 *(Deployed to workspace, fix/penny-cf3-soft-reconnect branch pending review)*
 
 ### CF-4: Stale-CLOB emergency reconnect when prices dead during buy window
