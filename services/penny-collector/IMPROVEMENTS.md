@@ -262,6 +262,10 @@ old positions, and records P&L correctly.
 **Observed outcome:** Position 0x33adb17d36 (Down@$0.990, slippageReject=true, builder-relayer fill)
 was redeemed successfully via relayer on restart → +$0.05 (+1.0%) profit recorded.
 *(Implemented via `fix/penny-journal-hydration`)*
+**⚠️ NOT YET DEPLOYED to workspace:** Branch exists but is NOT merged to master / workspace.
+Workspace `init()` still only populates `betConditionIds` (dedup), NOT `this.positions`. Confirmed
+impact (cycle 16): BTC/15m/Up@$0.970 ($5 bet, winner, interrupted by SIGHUP in cycle 15) survived
+the setpriv restart as a dedup entry only — tokens stuck unredeemed on-chain. Merge + deploy ASAP.
 
 ### IN-9: SIGHUP restart loop — graceful shutdown on su session termination ⭐ FIXED
 **Observed:** "Session terminated, killing shell..." appears every 3-10 minutes for ALL services
@@ -334,8 +338,9 @@ can send SIGHUP via keyring revocation. Restarts continued.
 `setpriv` (util-linux 2.38.1, available in container) drops privileges by calling setuid/setgid
 directly — NO PAM session opened, NO SIGHUP ever sent. node UID=1000, GID=1000 (official node image).
 Applied to all 6 service entrypoints (openclaw/docker-compose.yml + deploy/docker-compose.yml).
-**Verification:** Container shows `(healthy)` immediately after switch to setpriv. No "Session
-terminated" in logs. Awaiting 15+ minute clean run to confirm no spontaneous restarts.
+**Verification:** ⭐ CONFIRMED IN PRODUCTION (cycle 16) — Container ran 10+ minutes with status
+`Up 10 minutes (healthy)` and zero "Session terminated" messages. Previous runuser version
+restarted every 3-10 minutes; setpriv version shows zero restarts. Fix proven.
 *(Implemented via fix/penny-md3-liquidity-thresholds commit 2)*
 
 ### MD-3: 4h market liquidity threshold excludes thinly-traded but valid markets ⭐ FIXED
